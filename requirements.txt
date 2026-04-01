@@ -1,0 +1,10 @@
+datasets
+tdqm
+torch
+transformers
+scikit-learn
+numpy
+pandas
+matplotlib
+python-dotenv
+huggingface_hub
