@@ -141,23 +141,28 @@ def extract_answer(generated_text: str) -> str:
     Trích xuất phần answer từ text đã generate (phần mới sau prompt).
 
     Chiến lược:
-        1. Lấy text sau "Answer:" cuối cùng nếu model echo lại.
+        1. Nếu model echo lại "Answer:", lấy phần sau marker đó.
         2. Lấy dòng đầu tiên non-empty.
-        3. Truncate tại dấu câu kết thúc câu / newline ẩn.
+        3. KHÔNG truncate tại dấu câu — tránh cắt nhầm câu trả lời
+           chứa dấu chấm (vd: "St. Mary's", "3.5 million", "U.S.A.").
+           Chỉ truncate tại newline tiếp theo hoặc khi gặp double-newline.
+
+    Note: Truncation aggressive bằng regex dấu câu gây mất thông tin
+    với entity names, số thập phân, và abbreviations — không dùng.
     """
-    # Lấy phần sau "Answer:" cuối cùng nếu model vô tình echo lại
+    # Bước 1: Bỏ phần echo của prompt nếu có
     marker = "Answer:"
     if marker in generated_text:
         generated_text = generated_text.split(marker)[-1]
 
-    # Lấy dòng đầu tiên có nội dung
+    # Bước 2: Lấy dòng đầu tiên non-empty
+    # split("\n") xử lý cả \r\n và \n
     for line in generated_text.split("\n"):
         line = line.strip()
         if line:
-            # Truncate tại dấu chấm / hỏi / chấm than kết thúc câu
-            line = re.split(r"(?<=[.!?])\s", line)[0].strip()
             return line
 
+    # Fallback: trả về toàn bộ nếu không có newline
     return generated_text.strip()
 
 
@@ -229,7 +234,6 @@ def evaluate(
     per_sample_path = out_dir / "per_sample.jsonl"
 
     # ── Accumulators per language ─────────────────────────────────────────
-    # per_lang[lang] = {"em": [...], "f1": [...]}
     per_lang: Dict[str, Dict[str, List[float]]] = defaultdict(
         lambda: {"em": [], "f1": []}
     )
@@ -245,6 +249,11 @@ def evaluate(
             langs          = batch["lang"]                        # List[str]
             gold_list      = batch["answers"]                     # List[List[str]]
 
+            # Ghi nhớ input length TRƯỚC khi generate
+            # XSQuAD dùng left-padding nên output_ids = [B, input_len + new_tokens]
+            # Slice từ input_len để lấy đúng phần mới sinh ra
+            input_len = input_ids.shape[1]   # độ dài cố định (kể cả padding)
+
             # ── Generate ──────────────────────────────────────────────────
             with torch.no_grad():
                 output_ids = model.generate(
@@ -256,19 +265,18 @@ def evaluate(
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
-            # output_ids: [B, L + new_tokens]
+            # output_ids: [B, input_len + new_tokens]
 
             # ── Decode only newly generated tokens ───────────────────────
-            # attention_mask.sum(1) = real prompt length per sample (excluding left-pad)
-            prompt_lens = attention_mask.sum(dim=1).tolist()
-
             for i in range(len(langs)):
                 lang         = langs[i]
                 gold_answers = gold_list[i]
 
-                prompt_len = int(prompt_lens[i])
-                new_ids    = output_ids[i][prompt_len:]
-                raw_pred   = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+                # Slice từ input_len — đúng với left-padding
+                # (attention_mask.sum() chỉ cho biết real prompt len,
+                #  nhưng output_ids bắt đầu từ vị trí 0 của padded input)
+                new_ids  = output_ids[i][input_len:]
+                raw_pred = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
                 # Post-process
                 prediction = extract_answer(raw_pred)
