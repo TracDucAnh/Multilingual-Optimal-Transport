@@ -11,10 +11,11 @@ Dataset và DataLoader cho zero-shot evaluation trên ba multilingual benchmarks
 Generation Strategy (MMMLU / XNLI / XSQuAD)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Tất cả 3 tasks đều dùng generation mode:
-    - Prompt-only batches (left-padded cho batch generation)
-    - model.generate() → decode → parse/normalize output
-    - So sánh output với gold label
+Backbone: meta-llama/Meta-Llama-3-8B-Instruct
+    - Prompt được wrap bằng chat template (apply_chat_template)
+    - Left-padded cho batch generation
+    - model.generate() → decode ONLY new tokens → parse/normalize output
+    - Instruct model tuân theo instruction tốt hơn → giảm unknown / parse fail
 
 MMMLU : model phải output đúng "A", "B", "C", hoặc "D"
 XNLI  : model phải output đúng "entailment", "neutral", hoặc "contradiction"
@@ -22,7 +23,7 @@ XSQuAD: model output câu trả lời tự do → F1 / EM vs gold answers
 
 Batch keys (tất cả tasks)
 ──────────────────────────
-    input_ids       LongTensor [B, L]    — prompt left-padded
+    input_ids       LongTensor [B, L]    — prompt left-padded (sau chat template)
     attention_mask  LongTensor [B, L]
     gold_label      List[str]            — ground-truth string label
     task            List[str]            — "mmmlu" / "xnli" / "xsquad"
@@ -46,12 +47,19 @@ from tqdm import tqdm
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "meta-llama/Meta-Llama-3-8B"
+DEFAULT_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
 
 XNLI_LABEL_MAP  = {0: "entailment", 1: "neutral", 2: "contradiction"}
 XNLI_CANDIDATES = ["entailment", "neutral", "contradiction"]
 
 MCQ_OPTIONS = ["A", "B", "C", "D"]
+
+# System prompt dùng chung — giữ ngắn, rõ ràng để instruct model không verbose
+_SYSTEM_PROMPT = (
+    "You are a precise answer extraction assistant. "
+    "Always respond with only the answer and nothing else. "
+    "Do not explain, do not repeat the question."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -69,13 +77,13 @@ def _chunked(lst: list, size: int):
 
 
 # ---------------------------------------------------------------------------
-# Prompt builders
+# Prompt builders  (trả về user message text — chưa apply chat template)
 # ---------------------------------------------------------------------------
 
 def _build_mmmlu_prompt(record: dict) -> str:
     """
-    Prompt MMMLU — model phải trả lời đúng 1 chữ cái: A, B, C hoặc D.
-    Prompt được thiết kế để model complete ngay bằng chữ cái đó.
+    User message cho MMMLU.
+    Instruct model được yêu cầu trả lời đúng 1 ký tự: A / B / C / D.
     """
     subject     = record.get("Subject", "general knowledge").replace("_", " ")
     question    = record["Question"].strip()
@@ -86,51 +94,97 @@ def _build_mmmlu_prompt(record: dict) -> str:
         f"The following is a multiple choice question about {subject}.\n\n"
         f"Question: {question}\n"
         f"{options_str}\n\n"
-        f"Answer with only the letter (A, B, C, or D).\n"
-        f"Answer:"
+        f"Reply with only the single letter of the correct answer (A, B, C, or D). "
+        f"Do not include any other text."
     )
 
 
 def _build_xnli_prompt(record: dict) -> str:
     """
-    Prompt XNLI — model phải trả lời đúng 1 từ:
-    entailment, neutral, hoặc contradiction.
+    User message cho XNLI.
+    Instruct model trả lời đúng 1 từ: entailment / neutral / contradiction.
     """
     premise    = record["premise"].strip()
     hypothesis = record["hypothesis"].strip()
     return (
-        f"Determine the logical relationship between the premise and hypothesis.\n"
-        f"Answer with only one word: entailment, neutral, or contradiction.\n\n"
+        f"Determine the logical relationship between the following premise and hypothesis.\n\n"
         f"Premise: {premise}\n"
-        f"Hypothesis: {hypothesis}\n"
-        f"Relationship:"
+        f"Hypothesis: {hypothesis}\n\n"
+        f"Reply with exactly one word — either 'entailment', 'neutral', or 'contradiction'. "
+        f"Do not include any other text."
     )
 
 
 def _build_xsquad_prompt(record: dict) -> str:
-    """Prompt XSQuAD — generation tự do."""
+    """
+    User message cho XSQuAD.
+    Instruct model trả lời ngắn gọn, đúng span có trong passage.
+    """
     context  = record["context"].strip()
     question = record["question"].strip()
     return (
-        f"Read the following passage carefully and answer the question based on it.\n\n"
+        f"Read the passage below and answer the question with a short phrase or span "
+        f"taken directly from the passage. Do not include any other text.\n\n"
         f"Passage: {context}\n\n"
-        f"Question: {question}\n"
-        f"Answer:"
+        f"Question: {question}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Base Generation Dataset  (left-padded, prompt-only)
+# Chat-template encoder
+# ---------------------------------------------------------------------------
+
+def _apply_chat_template(
+    tokenizer: PreTrainedTokenizerBase,
+    user_message: str,
+    max_length: int,
+) -> Dict[str, torch.Tensor]:
+    """
+    Wrap user_message bằng Llama-3-Instruct chat template rồi tokenize.
+
+    Trả về dict với:
+        input_ids      : LongTensor [L]
+        attention_mask : LongTensor [L]
+
+    add_generation_prompt=True để model biết đây là lúc cần generate assistant turn.
+    Truncation thực hiện ở phía LEFT (bỏ đầu) để giữ instruction cuối cùng.
+    """
+    messages = [
+        {"role": "system",    "content": _SYSTEM_PROMPT},
+        {"role": "user",      "content": user_message},
+    ]
+    # tokenize=False để lấy string → tokenize thủ công với truncation left
+    chat_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,  # thêm <|start_header_id|>assistant<|end_header_id|>
+    )
+    encoded = tokenizer(
+        chat_text,
+        add_special_tokens=False,   # chat template đã có BOS/EOS
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+        return_tensors="pt",
+    )
+    return {
+        "input_ids":      encoded["input_ids"].squeeze(0),       # [L]
+        "attention_mask": encoded["attention_mask"].squeeze(0),  # [L]
+    }
+
+
+# ---------------------------------------------------------------------------
+# Base Generation Dataset  (left-padded, prompt-only, Instruct template)
 # ---------------------------------------------------------------------------
 
 class _BaseGenerationDataset(Dataset):
     """
-    Prompt-only dataset cho generation mode.
+    Prompt-only dataset cho generation mode với Instruct model.
 
-    Mỗi sample chứa:
-        input_ids      : [BOS] <prompt tokens>  (left-padded trong collate)
+    Mỗi sample:
+        input_ids      : chat-formatted + tokenized (left-pad trong collate)
         attention_mask : tương ứng
-        gold_label     : str  — ground-truth label để so sánh với output
+        gold_label     : str  — ground-truth label
         task           : str
         lang           : str
     """
@@ -146,37 +200,31 @@ class _BaseGenerationDataset(Dataset):
         self.records    = records
         self.tokenizer  = tokenizer
         self.max_length = max_length
-        self.bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
 
-    def _build_prompt(self, record: dict) -> str:
+    def _build_user_message(self, record: dict) -> str:
+        """Override trong subclass để trả về user message string."""
         raise NotImplementedError
-
-    def _encode(self, text: str) -> List[int]:
-        return self.tokenizer.encode(text, add_special_tokens=False)
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, idx: int) -> Dict:
-        record = self.records[idx]
+        record     = self.records[idx]
         lang       = record["_lang"]
-        gold_label = record["_gold_label"]   # str
+        gold_label = record["_gold_label"]
 
-        prompt_ids = self._encode(self._build_prompt(record))
-        # Truncate prompt từ trái nếu vượt budget
-        budget     = self.max_length - len(self.bos)
-        prompt_ids = prompt_ids[-max(0, budget):]
-        full_ids   = self.bos + prompt_ids
+        user_msg = self._build_user_message(record)
+        encoded  = _apply_chat_template(self.tokenizer, user_msg, self.max_length)
 
         item = {
-            "input_ids":      torch.tensor(full_ids, dtype=torch.long),
-            "attention_mask": torch.ones(len(full_ids), dtype=torch.long),
+            "input_ids":      encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
             "gold_label":     gold_label,
             "task":           self.task_name,
             "lang":           lang,
         }
 
-        # XSQuAD cần thêm tất cả gold answers cho F1/EM
+        # XSQuAD cần toàn bộ gold answers cho F1/EM
         if "answers" in record:
             answers = record["answers"].get("text", [])
             item["answers"] = [a.strip() for a in answers if a.strip()] or ["no answer"]
@@ -185,7 +233,7 @@ class _BaseGenerationDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Left-pad collate (dùng cho tất cả generation tasks)
+# Left-pad collate  (dùng chung cho tất cả generation tasks)
 # ---------------------------------------------------------------------------
 
 def _collate_fn_generation(batch: List[Dict], pad_token_id: int) -> Dict:
@@ -213,7 +261,6 @@ def _collate_fn_generation(batch: List[Dict], pad_token_id: int) -> Dict:
         "lang":           [s["lang"]        for s in batch],
     }
 
-    # Thêm answers nếu có (XSQuAD)
     if "answers" in batch[0]:
         out["answers"] = [s["answers"] for s in batch]
 
@@ -225,7 +272,7 @@ def _collate_fn_generation(batch: List[Dict], pad_token_id: int) -> Dict:
 # ---------------------------------------------------------------------------
 
 class SortedLengthSampler(Sampler):
-    """Sort by prompt length để giảm padding trong batch."""
+    """Sort by prompt length để giảm padding waste trong batch."""
 
     def __init__(
         self,
@@ -267,6 +314,7 @@ def _get_tokenizer(tok: Optional[PreTrainedTokenizerBase]) -> PreTrainedTokenize
         print(f"[Tokenizer] Loading {DEFAULT_MODEL}")
         tok = AutoTokenizer.from_pretrained(DEFAULT_MODEL, use_fast=True)
     if tok.pad_token_id is None:
+        # Llama-3-Instruct: dùng eos_token_id làm pad (chuẩn HF)
         tok.pad_token_id = tok.eos_token_id
     return tok
 
@@ -301,12 +349,12 @@ def _build_generation_loader(
 
 class MMLUDownstreamDataset(_BaseGenerationDataset):
     """
-    Generation-mode dataset cho MMMLU.
+    Generation-mode dataset cho MMMLU (Instruct backbone).
     gold_label: "A" / "B" / "C" / "D"
     """
     task_name = "mmmlu"
 
-    def _build_prompt(self, record: dict) -> str:
+    def _build_user_message(self, record: dict) -> str:
         return _build_mmmlu_prompt(record)
 
 
@@ -332,7 +380,7 @@ def _load_mmmlu(mmmlu_dir: Path) -> List[dict]:
             print(f"[MMMLU] {lang_dir.name}: skipped {skipped} malformed records.")
         for r in valid:
             r["_lang"]       = lang_dir.name
-            r["_gold_label"] = r["Answer"].strip()   # "A" / "B" / "C" / "D"
+            r["_gold_label"] = r["Answer"].strip()
         records.extend(valid)
         print(f"[MMMLU] Loaded {len(valid):,} records from {lang_dir.name}/test.json")
 
@@ -341,11 +389,11 @@ def _load_mmmlu(mmmlu_dir: Path) -> List[dict]:
 
 class MMLUDownstreamDataLoader:
     """
-    Generation DataLoader cho MMMLU.
+    Generation DataLoader cho MMMLU (Instruct backbone).
 
     Batch keys
     ----------
-    input_ids       LongTensor [B, L]   — prompt left-padded
+    input_ids       LongTensor [B, L]   — prompt left-padded (chat template)
     attention_mask  LongTensor [B, L]
     gold_label      List[str]           — "A" / "B" / "C" / "D"
     task            List[str]           — ["mmmlu", ...]
@@ -400,12 +448,12 @@ class MMLUDownstreamDataLoader:
 
 class XNLIDataset(_BaseGenerationDataset):
     """
-    Generation-mode dataset cho XNLI.
+    Generation-mode dataset cho XNLI (Instruct backbone).
     gold_label: "entailment" / "neutral" / "contradiction"
     """
     task_name = "xnli"
 
-    def _build_prompt(self, record: dict) -> str:
+    def _build_user_message(self, record: dict) -> str:
         return _build_xnli_prompt(record)
 
 
@@ -428,7 +476,7 @@ def _load_xnli(xnli_dir: Path) -> List[dict]:
             print(f"[XNLI] {lang_dir.name}: skipped {skipped} records with label=-1.")
         for r in valid:
             r["_lang"]       = lang_dir.name
-            r["_gold_label"] = XNLI_LABEL_MAP[r["label"]]  # "entailment" / "neutral" / "contradiction"
+            r["_gold_label"] = XNLI_LABEL_MAP[r["label"]]
         records.extend(valid)
         print(f"[XNLI] Loaded {len(valid):,} records from {lang_dir.name}/test.json")
 
@@ -437,11 +485,11 @@ def _load_xnli(xnli_dir: Path) -> List[dict]:
 
 class XNLIDataLoader:
     """
-    Generation DataLoader cho XNLI.
+    Generation DataLoader cho XNLI (Instruct backbone).
 
     Batch keys
     ----------
-    input_ids       LongTensor [B, L]   — prompt left-padded
+    input_ids       LongTensor [B, L]   — prompt left-padded (chat template)
     attention_mask  LongTensor [B, L]
     gold_label      List[str]           — "entailment" / "neutral" / "contradiction"
     task            List[str]           — ["xnli", ...]
@@ -453,7 +501,7 @@ class XNLIDataLoader:
         data_root: str = "../raw_data/",
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         batch_size: int = 16,
-        max_length: int = 256,
+        max_length: int = 512,
         shuffle: bool = False,
         seed: int = 42,
         num_workers: int = 0,
@@ -493,10 +541,10 @@ class XNLIDataLoader:
 # ---------------------------------------------------------------------------
 
 class XSQuADDataset(_BaseGenerationDataset):
-    """Generation-mode dataset cho XSQuAD."""
+    """Generation-mode dataset cho XSQuAD (Instruct backbone)."""
     task_name = "xsquad"
 
-    def _build_prompt(self, record: dict) -> str:
+    def _build_user_message(self, record: dict) -> str:
         return _build_xsquad_prompt(record)
 
 
@@ -529,7 +577,7 @@ def _load_xsquad(xsquad_dir: Path) -> List[dict]:
 
 
 class XSQuADDataLoader:
-    """Generation DataLoader cho XSQuAD."""
+    """Generation DataLoader cho XSQuAD (Instruct backbone)."""
 
     def __init__(
         self,
@@ -589,7 +637,7 @@ if __name__ == "__main__":
     DATA_ROOT = "../raw_data/"
 
     print("=" * 60)
-    print("Loading shared tokenizer ...")
+    print("Loading shared tokenizer (Llama-3-8B-Instruct) ...")
     print("=" * 60)
     tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL, use_fast=True)
     if tokenizer.pad_token_id is None:
@@ -604,7 +652,7 @@ if __name__ == "__main__":
     }
 
     print("\n" + "=" * 60)
-    print("Smoke-tests: MMMLU / XNLI / XSQuAD (generation mode)")
+    print("Smoke-tests: MMMLU / XNLI / XSQuAD (Instruct, generation mode)")
     print("=" * 60)
 
     for name, loader in loaders.items():
@@ -617,10 +665,9 @@ if __name__ == "__main__":
         assert "gold_label" in batch,      f"{name}: missing gold_label"
         assert isinstance(batch["gold_label"], list)
         assert isinstance(batch["gold_label"][0], str)
-        assert "lang"       in batch
-        assert "task"       in batch
+        assert "lang" in batch
+        assert "task" in batch
 
-        # Kiểm tra gold_label hợp lệ
         if name == "MMMLU":
             assert all(g in MCQ_OPTIONS for g in batch["gold_label"]), \
                 f"MMMLU: gold_label phải trong {MCQ_OPTIONS}"
@@ -631,15 +678,14 @@ if __name__ == "__main__":
             assert "answers" in batch, "XSQuAD: missing answers"
             assert all(isinstance(a, list) for a in batch["answers"])
 
-        # In prompt đầu tiên
         ids_0  = batch["input_ids"][0]
         mask_0 = batch["attention_mask"][0]
-        prompt = tokenizer.decode(ids_0[mask_0 == 1], skip_special_tokens=True)
+        prompt = tokenizer.decode(ids_0[mask_0 == 1], skip_special_tokens=False)
 
         print(f"\n  ✓ {name}  shape={tuple(batch['input_ids'].shape)}  "
               f"task={batch['task'][0]}  langs={set(batch['lang'])}")
         print(f"  gold_label[0] = '{batch['gold_label'][0]}'")
-        print(f"  PROMPT (trunc 300 chars):\n  {prompt[:300]!r}")
+        print(f"  PROMPT (trunc 400 chars):\n  {prompt[:400]!r}")
 
     print("\n" + "=" * 60)
     print("✓ All smoke-tests passed.")

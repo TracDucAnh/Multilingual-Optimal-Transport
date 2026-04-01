@@ -1,20 +1,31 @@
 """
 MMMLU_evaluation.py
 ===================
-Zero-shot evaluation của Llama-3-8B (vanilla) trên MMMLU — generation mode.
+Zero-shot evaluation của Llama-3-8B-Instruct trên MMMLU — generation mode.
+
+Backbone: meta-llama/Meta-Llama-3-8B-Instruct
+    Prompt được wrap bằng chat template trong dataloader.
+    model.generate() chỉ decode PHẦN MỚI (sau input_len) để tránh echo prompt.
 
 Scoring Strategy — Generation + Exact Match:
-    model.generate() → decode → parse first valid letter (A/B/C/D) →
-    compare với gold label
+    model.generate() → decode new tokens only → parse first valid letter →
+    compare với gold label (A / B / C / D)
 
-Parse strategy:
-    Lấy dòng đầu tiên của output, tìm ký tự đầu tiên trong {A, B, C, D}
-    (case-insensitive). Nếu không tìm được → "unknown" → incorrect.
+Parse strategy (robust với Instruct output):
+    1. Lấy dòng đầu tiên non-empty của output.
+    2. Uppercase → tìm ký tự đầu tiên trong {A, B, C, D}.
+    3. Nếu không tìm được → "unknown" → incorrect.
+
+    Ví dụ output instruct model:
+        "A"                → "A"
+        "The answer is B." → "B"
+        "C. Paris"         → "C"
+        "(D)"              → "D"
 
 Usage:
     python MMMLU_evaluation.py
-    python MMMLU_evaluation.py --batch_size 8 --max_new_tokens 8
-    python MMMLU_evaluation.py --data_root ../raw_data/ --output_dir results/mmmlu_vanilla/
+    python MMMLU_evaluation.py --batch_size 8 --max_new_tokens 16
+    python MMMLU_evaluation.py --data_root ../raw_data/ --output_dir results/mmmlu_instruct/
 """
 
 import argparse
@@ -39,7 +50,7 @@ from downstream_dataloader import MMLUDownstreamDataLoader, MCQ_OPTIONS  # noqa:
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_NAME   = "meta-llama/Meta-Llama-3-8B"
+MODEL_NAME   = "meta-llama/Meta-Llama-3-8B-Instruct"
 VALID_LABELS = set(MCQ_OPTIONS)  # {"A", "B", "C", "D"}
 
 
@@ -71,7 +82,7 @@ def load_model_and_tokenizer(dtype_str: str = "bf16"):
 
 def parse_mmmlu_output(raw_text: str) -> str:
     """
-    Parse output của model thành một trong 4 nhãn MMMLU: A / B / C / D.
+    Parse output của Instruct model thành một trong 4 nhãn MMMLU: A / B / C / D.
 
     Chiến lược:
         1. Lấy dòng đầu tiên non-empty.
@@ -79,12 +90,11 @@ def parse_mmmlu_output(raw_text: str) -> str:
         3. Tìm ký tự đầu tiên trong string là A, B, C, hoặc D.
         4. Nếu không tìm được → "unknown".
 
-    Ví dụ:
-        "A"          → "A"
-        "Answer: B"  → "B"
-        " (C) "      → "C"
-        "The answer is D because..." → "D"
-        "Yes"        → "unknown"
+    Robust với các dạng output instruct model thường sinh ra:
+        "A"                → "A"
+        "The answer is B." → "B"
+        "(C) some text"    → "C"
+        "D. explanation"   → "D"
 
     Returns
     -------
@@ -92,9 +102,9 @@ def parse_mmmlu_output(raw_text: str) -> str:
     """
     first_line = ""
     for line in raw_text.split("\n"):
-        line = line.strip()
-        if line:
-            first_line = line.upper()
+        stripped = line.strip()
+        if stripped:
+            first_line = stripped.upper()
             break
 
     if not first_line:
@@ -115,15 +125,17 @@ def evaluate(
     model,
     tokenizer,
     data_root: str      = "../raw_data/",
-    output_dir: str     = "results/mmmlu_vanilla/",
+    output_dir: str     = "results/mmmlu_instruct/",
     batch_size: int     = 8,
     max_length: int     = 512,
-    max_new_tokens: int = 8,
+    max_new_tokens: int = 16,
     num_beams: int      = 1,
 ) -> Dict:
     """
-    Generation-mode evaluation trên MMMLU.
-    max_new_tokens=8 là đủ — model chỉ cần output 1 ký tự.
+    Generation-mode evaluation trên MMMLU với Instruct backbone.
+
+    max_new_tokens=16: đủ cho instruct model output "A" hoặc "The answer is A."
+    New tokens sliced từ input_len để tránh echo lại prompt.
     """
     device = next(model.parameters()).device
 
@@ -148,12 +160,15 @@ def evaluate(
     t0            = time.time()
 
     with open(per_sample_path, "w", encoding="utf-8") as fout:
-        for batch in tqdm(loader, desc="MMMLU generation eval"):
-            input_ids      = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            gold_labels    = batch["gold_label"]
-            langs          = batch["lang"]
-            input_len      = input_ids.shape[1]
+        for batch in tqdm(loader, desc="MMMLU generation eval (Instruct)"):
+            input_ids      = batch["input_ids"].to(device)       # [B, L]
+            attention_mask = batch["attention_mask"].to(device)  # [B, L]
+            gold_labels    = batch["gold_label"]                  # List[str]
+            langs          = batch["lang"]                        # List[str]
+
+            # Ghi nhớ độ dài input (kể cả left-padding)
+            # → slice output_ids[i][input_len:] để lấy đúng phần mới sinh
+            input_len = input_ids.shape[1]
 
             with torch.no_grad():
                 output_ids = model.generate(
@@ -165,11 +180,13 @@ def evaluate(
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
+            # output_ids: [B, input_len + new_tokens]
 
             for i in range(len(langs)):
                 lang       = langs[i]
                 gold_label = gold_labels[i]
 
+                # Chỉ decode phần mới — tránh echo prompt dài của instruct template
                 new_ids    = output_ids[i][input_len:]
                 raw_output = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
                 pred_label = parse_mmmlu_output(raw_output)
@@ -201,9 +218,9 @@ def evaluate(
     # ── Per-language accuracy ─────────────────────────────────────────────
     per_lang_summary: Dict[str, Dict] = {}
 
-    print(f"\n{'═'*58}")
+    print(f"\n{'═'*60}")
     print(f"  MMMLU Zero-shot Results (Generation) — {MODEL_NAME}")
-    print(f"{'═'*58}")
+    print(f"{'═'*60}")
     print(f"  {'Language':<14}  {'N':>6}  {'Accuracy (%)':>13}")
     print(f"  {'─'*14}  {'─'*6}  {'─'*13}")
 
@@ -219,9 +236,9 @@ def evaluate(
 
     print(f"  {'─'*14}  {'─'*6}  {'─'*13}")
     print(f"  {'OVERALL':<14}  {n_samples:>6,}  {overall_acc:>13.2f}")
-    print(f"{'═'*58}")
+    print(f"{'═'*60}")
     print(f"  Random baseline: 25.00%")
-    print(f"{'═'*58}\n")
+    print(f"{'═'*60}\n")
 
     print(f"  Prediction distribution (bias check):")
     print(f"  {'Label':<10}  {'Count':>8}  {'%':>7}")
@@ -231,16 +248,16 @@ def evaluate(
     print()
 
     summary = {
-        "model":     MODEL_NAME,
-        "task":      "MMMLU",
-        "mode":      "zero-shot generation",
-        "n_samples": n_samples,
-        "valid_labels": MCQ_OPTIONS,
+        "model":          MODEL_NAME,
+        "task":           "MMMLU",
+        "mode":           "zero-shot generation (Instruct)",
+        "n_samples":      n_samples,
+        "valid_labels":   MCQ_OPTIONS,
         "random_baseline": 25.0,
-        "overall":   {"accuracy": round(overall_acc, 2)},
-        "per_lang":  per_lang_summary,
+        "overall":        {"accuracy": round(overall_acc, 2)},
+        "per_lang":       per_lang_summary,
         "prediction_distribution": pred_dist,
-        "unknown_count": unknown_count,
+        "unknown_count":  unknown_count,
         "generation_config": {
             "max_new_tokens": max_new_tokens,
             "num_beams":      num_beams,
@@ -265,14 +282,14 @@ def evaluate(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MMMLU zero-shot generation evaluation — Llama-3-8B"
+        description="MMMLU zero-shot generation evaluation — Llama-3-8B-Instruct"
     )
     parser.add_argument("--data_root",      type=str, default="../raw_data/")
-    parser.add_argument("--output_dir",     type=str, default="results/mmmlu_vanilla/")
+    parser.add_argument("--output_dir",     type=str, default="results/mmmlu_instruct/")
     parser.add_argument("--batch_size",     type=int, default=8)
     parser.add_argument("--max_length",     type=int, default=512)
-    parser.add_argument("--max_new_tokens", type=int, default=8,
-                        help="8 là đủ cho 1 chữ cái A/B/C/D")
+    parser.add_argument("--max_new_tokens", type=int, default=16,
+                        help="16 đủ cho instruct output 'A' hoặc 'The answer is A.'")
     parser.add_argument("--num_beams",      type=int, default=1)
     parser.add_argument("--dtype",          type=str, default="bf16",
                         choices=["bf16", "fp16", "fp32"])

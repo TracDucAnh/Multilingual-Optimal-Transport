@@ -1,13 +1,16 @@
 """
 XSQuAD_evaluation.py
 ====================
-Zero-shot evaluation của Llama-3-8B (vanilla, không fine-tune) trên toàn bộ
-tập dữ liệu XSQuAD — tất cả ngôn ngữ.
+Zero-shot evaluation của Llama-3-8B-Instruct trên XSQuAD — generation mode.
+
+Backbone: meta-llama/Meta-Llama-3-8B-Instruct
+    Prompt được wrap bằng chat template trong dataloader.
+    model.generate() chỉ decode PHẦN MỚI (sau input_len) để tránh echo prompt.
 
 Pipeline:
-    1. Load XSQuADDataLoader  (generation mode, left-padded batches)
-    2. model.generate()  →  decode  →  normalize
-    3. Tính F1 / EM per-sample  →  aggregate per-lang + overall
+    1. Load XSQuADDataLoader  (chat-template, left-padded batches)
+    2. model.generate() → decode new tokens only → extract_answer → normalize
+    3. Tính F1 / EM per-sample → aggregate per-lang + overall
 
 Normalize strategy (SQuAD chuẩn):
     - Lowercase
@@ -16,15 +19,20 @@ Normalize strategy (SQuAD chuẩn):
     - Collapse whitespace
     F1 tính ở mức token (unigram overlap).
 
+extract_answer strategy (dành cho Instruct output):
+    Instruct model thường trả lời ngắn gọn, đúng span.
+    Lấy dòng đầu tiên non-empty → strip → đó là answer.
+    Không cần tìm "Answer:" marker vì new tokens KHÔNG chứa prompt echo.
+
 Kết quả lưu vào:
-    results/xsquad_vanilla/
+    results/xsquad_instruct/
         summary.json       — overall + per_lang metrics
         per_sample.jsonl   — từng sample: prediction, gold, em, f1
 
 Usage:
     python XSQuAD_evaluation.py
-    python XSQuAD_evaluation.py --batch_size 8 --max_new_tokens 64
-    python XSQuAD_evaluation.py --data_root ../raw_data/ --output_dir results/xsquad_vanilla/
+    python XSQuAD_evaluation.py --batch_size 4 --max_new_tokens 64
+    python XSQuAD_evaluation.py --data_root ../raw_data/ --output_dir results/xsquad_instruct/
 """
 
 import argparse
@@ -44,10 +52,6 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sys
-# Cau truc project:  Multilingual OT/
-#                        dataloader/downstream_dataloader.py
-#                        zero-shot/XSQuAD_evaluation.py
-# parent.parent = project root (Multilingual OT/)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "dataloader"))
 from downstream_dataloader import XSQuADDataLoader  # noqa: E402
 
@@ -55,7 +59,7 @@ from downstream_dataloader import XSQuADDataLoader  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-MODEL_NAME  = "meta-llama/Meta-Llama-3-8B"
+MODEL_NAME  = "meta-llama/Meta-Llama-3-8B-Instruct"
 ARTICLES_RE = re.compile(r"\b(a|an|the)\b", re.IGNORECASE)
 
 
@@ -133,37 +137,46 @@ def score_prediction(prediction: str, gold_answers: List[str]) -> Tuple[float, f
 
 
 # ---------------------------------------------------------------------------
-# Post-processing prediction
+# Post-processing prediction (Instruct-aware)
 # ---------------------------------------------------------------------------
 
 def extract_answer(generated_text: str) -> str:
     """
-    Trích xuất phần answer từ text đã generate (phần mới sau prompt).
+    Trích xuất câu trả lời từ phần mới sinh (new tokens only — không có prompt echo).
+
+    Với Instruct model, output thường là:
+        - Đúng span ngắn: "Albert Einstein"
+        - Câu ngắn: "The answer is Albert Einstein."
+        - Đôi khi kèm giải thích: "Albert Einstein, a physicist born in Germany."
 
     Chiến lược:
-        1. Nếu model echo lại "Answer:", lấy phần sau marker đó.
-        2. Lấy dòng đầu tiên non-empty.
-        3. KHÔNG truncate tại dấu câu — tránh cắt nhầm câu trả lời
-           chứa dấu chấm (vd: "St. Mary's", "3.5 million", "U.S.A.").
-           Chỉ truncate tại newline tiếp theo hoặc khi gặp double-newline.
+        1. Lấy dòng đầu tiên non-empty (Instruct thường output đúng span ở dòng 1).
+        2. Nếu có prefix "The answer is:" / "Answer:" → bỏ prefix đó.
+        3. KHÔNG truncate tại dấu câu nội tuyến — tránh cắt nhầm entity names
+           như "St. Mary's", "3.5 million", "U.S.A.", v.v.
 
-    Note: Truncation aggressive bằng regex dấu câu gây mất thông tin
-    với entity names, số thập phân, và abbreviations — không dùng.
+    Note: Không cần tìm "Answer:" echo từ prompt vì chúng ta chỉ decode new tokens.
     """
-    # Bước 1: Bỏ phần echo của prompt nếu có
-    marker = "Answer:"
-    if marker in generated_text:
-        generated_text = generated_text.split(marker)[-1]
+    text = generated_text.strip()
 
-    # Bước 2: Lấy dòng đầu tiên non-empty
-    # split("\n") xử lý cả \r\n và \n
-    for line in generated_text.split("\n"):
-        line = line.strip()
-        if line:
-            return line
+    # Lấy dòng đầu tiên non-empty
+    first_line = ""
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped:
+            first_line = stripped
+            break
 
-    # Fallback: trả về toàn bộ nếu không có newline
-    return generated_text.strip()
+    if not first_line:
+        return text  # fallback: toàn bộ output
+
+    # Bỏ các prefix phổ biến của instruct model
+    for prefix in ("The answer is:", "The answer is", "Answer:", "Answer"):
+        if first_line.lower().startswith(prefix.lower()):
+            first_line = first_line[len(prefix):].strip(" .,")
+            break
+
+    return first_line if first_line else text
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +184,7 @@ def extract_answer(generated_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def load_model_and_tokenizer(dtype_str: str = "bf16"):
-    """Load Llama-3-8B vanilla với dtype tuỳ chọn."""
+    """Load Llama-3-8B-Instruct với dtype tuỳ chọn."""
     dtype_map = {
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
@@ -203,14 +216,14 @@ def evaluate(
     model,
     tokenizer,
     data_root: str  = "../raw_data/",
-    output_dir: str = "results/xsquad_vanilla/",
+    output_dir: str = "results/xsquad_instruct/",
     batch_size: int = 4,
     max_length: int = 1024,
     max_new_tokens: int = 64,
     num_beams: int = 1,
 ) -> Dict:
     """
-    Chạy toàn bộ evaluation pipeline trên XSQuAD.
+    Chạy toàn bộ evaluation pipeline trên XSQuAD với Instruct backbone.
 
     Returns
     -------
@@ -233,7 +246,7 @@ def evaluate(
     out_dir.mkdir(parents=True, exist_ok=True)
     per_sample_path = out_dir / "per_sample.jsonl"
 
-    # ── Accumulators per language ─────────────────────────────────────────
+    # ── Accumulators ──────────────────────────────────────────────────────
     per_lang: Dict[str, Dict[str, List[float]]] = defaultdict(
         lambda: {"em": [], "f1": []}
     )
@@ -243,16 +256,16 @@ def evaluate(
     t0 = time.time()
 
     with open(per_sample_path, "w", encoding="utf-8") as fout:
-        for batch in tqdm(loader, desc="XSQuAD zero-shot eval"):
+        for batch in tqdm(loader, desc="XSQuAD zero-shot eval (Instruct)"):
             input_ids      = batch["input_ids"].to(device)       # [B, L]
             attention_mask = batch["attention_mask"].to(device)  # [B, L]
             langs          = batch["lang"]                        # List[str]
             gold_list      = batch["answers"]                     # List[List[str]]
 
-            # Ghi nhớ input length TRƯỚC khi generate
-            # XSQuAD dùng left-padding nên output_ids = [B, input_len + new_tokens]
-            # Slice từ input_len để lấy đúng phần mới sinh ra
-            input_len = input_ids.shape[1]   # độ dài cố định (kể cả padding)
+            # Ghi nhớ input_len để slice đúng phần new tokens
+            # Left-padding: tất cả sequences trong batch có cùng độ dài L
+            # → output_ids[i][input_len:] là phần model sinh ra
+            input_len = input_ids.shape[1]
 
             # ── Generate ──────────────────────────────────────────────────
             with torch.no_grad():
@@ -272,13 +285,11 @@ def evaluate(
                 lang         = langs[i]
                 gold_answers = gold_list[i]
 
-                # Slice từ input_len — đúng với left-padding
-                # (attention_mask.sum() chỉ cho biết real prompt len,
-                #  nhưng output_ids bắt đầu từ vị trí 0 của padded input)
+                # New tokens only — không có prompt echo (instruct template)
                 new_ids  = output_ids[i][input_len:]
                 raw_pred = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
-                # Post-process
+                # Post-process: lấy dòng đầu, bỏ prefix nếu có
                 prediction = extract_answer(raw_pred)
 
                 # Score vs gold (max over all gold answers)
@@ -294,6 +305,7 @@ def evaluate(
                 record = {
                     "sample_id":  sample_idx,
                     "lang":       lang,
+                    "raw_output": raw_pred,
                     "prediction": prediction,
                     "gold":       gold_answers,
                     "em":         em,
@@ -309,9 +321,9 @@ def evaluate(
     # ── Per-language aggregation ──────────────────────────────────────────
     per_lang_summary: Dict[str, Dict] = {}
 
-    print(f"\n{'═'*60}")
+    print(f"\n{'═'*62}")
     print(f"  XSQuAD Zero-shot Results — {MODEL_NAME}")
-    print(f"{'═'*60}")
+    print(f"{'═'*62}")
     print(f"  {'Language':<14}  {'N':>6}  {'EM (%)':>9}  {'F1 (%)':>9}")
     print(f"  {'─'*14}  {'─'*6}  {'─'*9}  {'─'*9}")
 
@@ -334,13 +346,13 @@ def evaluate(
 
     print(f"  {'─'*14}  {'─'*6}  {'─'*9}  {'─'*9}")
     print(f"  {'OVERALL':<14}  {n_total:>6,}  {overall_em:>9.2f}  {overall_f1:>9.2f}")
-    print(f"{'═'*60}\n")
+    print(f"{'═'*62}\n")
 
     # ── Build summary dict ────────────────────────────────────────────────
     summary = {
         "model":   MODEL_NAME,
         "task":    "XSQuAD",
-        "mode":    "zero-shot generation",
+        "mode":    "zero-shot generation (Instruct)",
         "n_samples": n_total,
         "overall": {
             "em": round(overall_em, 2),
@@ -373,15 +385,15 @@ def evaluate(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="XSQuAD zero-shot evaluation — Llama-3-8B vanilla baseline"
+        description="XSQuAD zero-shot evaluation — Llama-3-8B-Instruct baseline"
     )
     parser.add_argument(
         "--data_root", type=str, default="../raw_data/",
         help="Path đến thư mục raw_data/ (default: ../raw_data/)"
     )
     parser.add_argument(
-        "--output_dir", type=str, default="results/xsquad_vanilla/",
-        help="Thư mục lưu kết quả (default: results/xsquad_vanilla/)"
+        "--output_dir", type=str, default="results/xsquad_instruct/",
+        help="Thư mục lưu kết quả (default: results/xsquad_instruct/)"
     )
     parser.add_argument(
         "--batch_size", type=int, default=4,
@@ -414,17 +426,14 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
 
-    # HuggingFace login nếu cần (đọc HF_TOKEN từ .env)
     load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:
         login(token=hf_token)
         print("[HF] Logged in with HF_TOKEN from .env\n")
 
-    # Load model + tokenizer
     model, tokenizer = load_model_and_tokenizer(dtype_str=args.dtype)
 
-    # Run full evaluation
     summary = evaluate(
         model=model,
         tokenizer=tokenizer,
