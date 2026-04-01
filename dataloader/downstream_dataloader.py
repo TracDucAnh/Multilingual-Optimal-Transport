@@ -8,78 +8,28 @@ Dataset và DataLoader cho zero-shot evaluation trên ba multilingual benchmarks
     raw_data/downstream/XSQuAD/ — Cross-lingual Extractive QA
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Log-prob Scoring Strategy (MMMLU / XNLI)
+Generation Strategy (MMMLU / XNLI / XSQuAD)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Mỗi sample được mở rộng thành C rows (C = số candidates):
-    MMMLU : C = 4  → " A" / " B" / " C" / " D"
-    XNLI  : C = 3  → " entailment" / " neutral" / " contradiction"
+Tất cả 3 tasks đều dùng generation mode:
+    - Prompt-only batches (left-padded cho batch generation)
+    - model.generate() → decode → parse/normalize output
+    - So sánh output với gold label
 
-Mỗi row (sample_idx, cand_idx) encode:
-    input_ids : [BOS] <prompt tokens> <candidate tokens> [EOS]
-    labels    : -100 ... -100          <candidate>       [EOS]
+MMMLU : model phải output đúng "A", "B", "C", hoặc "D"
+XNLI  : model phải output đúng "entailment", "neutral", hoặc "contradiction"
+XSQuAD: model output câu trả lời tự do → F1 / EM vs gold answers
 
-Sau khi forward batch [B×C, L]:
-    loss_per_token = CrossEntropyLoss(reduction='none')   → [B×C, L]
-    mean_nll[i]    = mean(loss_per_token[i][labels != -100])
-                   ← mean NLL tránh bias candidate dài hơn
-    pred           = argmin over C candidates per sample  → Accuracy
-
-Batch keys (MMMLU / XNLI)
+Batch keys (tất cả tasks)
 ──────────────────────────
-    input_ids       LongTensor [B*C, L]
-    attention_mask  LongTensor [B*C, L]
-    labels          LongTensor [B*C, L]   -100 cho prompt & padding
-    sample_id       LongTensor [B*C]      index gốc của sample (để group C rows)
-    cand_id         LongTensor [B*C]      index của candidate (0..C-1)
-    gold_cand_id    LongTensor [B*C]      ground-truth candidate index (same per group)
-    num_candidates  int                   C (constant per task)
-    task            List[str]             "mmmlu" / "xnli"
-    lang            List[str]             language code
+    input_ids       LongTensor [B, L]    — prompt left-padded
+    attention_mask  LongTensor [B, L]
+    gold_label      List[str]            — ground-truth string label
+    task            List[str]            — "mmmlu" / "xnli" / "xsquad"
+    lang            List[str]            — language code
 
-Eval loop mẫu
-─────────────
-    all_nll, all_sample_id, all_cand_id, all_gold = [], [], [], []
-    for batch in loader:
-        with torch.no_grad():
-            out = model(input_ids=batch["input_ids"].to(device),
-                        attention_mask=batch["attention_mask"].to(device),
-                        labels=batch["labels"].to(device))
-        # CrossEntropyLoss trả về mean scalar; ta cần per-token
-        logits = out.logits                             # [B*C, L, V]
-        shift_logits = logits[:, :-1].contiguous()
-        shift_labels = batch["labels"][:, 1:].to(device).contiguous()
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
-        token_loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-        ).view(shift_labels.size())                     # [B*C, L-1]
-        n_ans = (shift_labels != -100).sum(-1).clamp(min=1)
-        mean_nll = token_loss.sum(-1) / n_ans           # [B*C]
-
-        all_nll.append(mean_nll.cpu())
-        all_sample_id.append(batch["sample_id"])
-        all_cand_id.append(batch["cand_id"])
-        all_gold.append(batch["gold_cand_id"])
-
-    all_nll       = torch.cat(all_nll)
-    all_sample_id = torch.cat(all_sample_id)
-    all_cand_id   = torch.cat(all_cand_id)
-    all_gold      = torch.cat(all_gold)
-
-    n_samples = all_sample_id.max().item() + 1
-    C         = loader.num_candidates
-    nll_mat   = torch.full((n_samples, C), float("inf"))
-    nll_mat[all_sample_id, all_cand_id] = all_nll
-    gold_mat  = torch.zeros(n_samples, dtype=torch.long)
-    gold_mat[all_sample_id] = all_gold
-    pred      = nll_mat.argmin(-1)
-    accuracy  = (pred == gold_mat).float().mean().item()
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Generation Strategy (XSQuAD)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Prompt-only batches (left-padded) → model.generate() → F1 / EM vs answers field.
+    (XSQuAD thêm)
+    answers         List[List[str]]      — tất cả gold answers (cho F1/EM)
 """
 
 import json
@@ -98,10 +48,10 @@ from tqdm import tqdm
 
 DEFAULT_MODEL = "meta-llama/Meta-Llama-3-8B"
 
-XNLI_LABEL_MAP   = {0: "entailment", 1: "neutral", 2: "contradiction"}
-XNLI_CANDIDATES  = ["entailment", "neutral", "contradiction"]   # fixed order → cand_id 0/1/2
+XNLI_LABEL_MAP  = {0: "entailment", 1: "neutral", 2: "contradiction"}
+XNLI_CANDIDATES = ["entailment", "neutral", "contradiction"]
 
-MCQ_OPTIONS      = ["A", "B", "C", "D"]
+MCQ_OPTIONS = ["A", "B", "C", "D"]
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +69,14 @@ def _chunked(lst: list, size: int):
 
 
 # ---------------------------------------------------------------------------
-# Prompt builders  (prompt string only — answer injected per candidate)
+# Prompt builders
 # ---------------------------------------------------------------------------
 
 def _build_mmmlu_prompt(record: dict) -> str:
-    """Return the prompt string (without the answer letter)."""
+    """
+    Prompt MMMLU — model phải trả lời đúng 1 chữ cái: A, B, C hoặc D.
+    Prompt được thiết kế để model complete ngay bằng chữ cái đó.
+    """
     subject     = record.get("Subject", "general knowledge").replace("_", " ")
     question    = record["Question"].strip()
     options_str = "\n".join(
@@ -132,18 +85,22 @@ def _build_mmmlu_prompt(record: dict) -> str:
     return (
         f"The following is a multiple choice question about {subject}.\n\n"
         f"Question: {question}\n"
-        f"{options_str}\n"
+        f"{options_str}\n\n"
+        f"Answer with only the letter (A, B, C, or D).\n"
         f"Answer:"
     )
 
 
 def _build_xnli_prompt(record: dict) -> str:
-    """Return the prompt string (without the label word)."""
+    """
+    Prompt XNLI — model phải trả lời đúng 1 từ:
+    entailment, neutral, hoặc contradiction.
+    """
     premise    = record["premise"].strip()
     hypothesis = record["hypothesis"].strip()
     return (
         f"Determine the logical relationship between the premise and hypothesis.\n"
-        f"Choose one of: entailment, neutral, contradiction.\n\n"
+        f"Answer with only one word: entailment, neutral, or contradiction.\n\n"
         f"Premise: {premise}\n"
         f"Hypothesis: {hypothesis}\n"
         f"Relationship:"
@@ -151,7 +108,7 @@ def _build_xnli_prompt(record: dict) -> str:
 
 
 def _build_xsquad_prompt(record: dict) -> str:
-    """Return prompt string for generation (answer withheld)."""
+    """Prompt XSQuAD — generation tự do."""
     context  = record["context"].strip()
     question = record["question"].strip()
     return (
@@ -163,221 +120,104 @@ def _build_xsquad_prompt(record: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Base multi-candidate Dataset
+# Base Generation Dataset  (left-padded, prompt-only)
 # ---------------------------------------------------------------------------
 
-class _BaseCandidateDataset(Dataset):
+class _BaseGenerationDataset(Dataset):
     """
-    Flat multi-candidate dataset cho log-prob scoring.
+    Prompt-only dataset cho generation mode.
 
-    Mỗi sample gốc được mở rộng thành ``num_candidates`` rows.
-    Row thứ ``c`` của sample thứ ``s`` có:
-        sample_id    = s
-        cand_id      = c
-        gold_cand_id = ground-truth candidate index (same for all c in group s)
-
-    Token layout (mỗi row):
-        input_ids : [BOS] <prompt tokens> <candidate tokens> [EOS]
-        labels    : -100 ... -100          <candidate>       [EOS]
-
-    Nếu vượt max_length, prompt bị truncate từ trái (giữ nguyên candidate tokens).
+    Mỗi sample chứa:
+        input_ids      : [BOS] <prompt tokens>  (left-padded trong collate)
+        attention_mask : tương ứng
+        gold_label     : str  — ground-truth label để so sánh với output
+        task           : str
+        lang           : str
     """
 
     task_name: str = "base"
 
     def __init__(
         self,
-        records: List[dict],                    # mỗi record có "_lang", "_gold_cand_id"
-        candidates: List[str],                  # ví dụ [" A", " B", " C", " D"]
+        records: List[dict],
         tokenizer: PreTrainedTokenizerBase,
         max_length: int = 512,
     ) -> None:
         self.records    = records
-        self.candidates = candidates            # List[str], đã có leading space
         self.tokenizer  = tokenizer
         self.max_length = max_length
-        self.num_candidates = len(candidates)
-
         self.bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
-        self.eos = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
-
-        # Mở rộng: mỗi sample → num_candidates rows
-        # self._items[i] = (sample_idx, cand_idx)
-        self._items: List[tuple] = [
-            (s, c)
-            for s in range(len(records))
-            for c in range(self.num_candidates)
-        ]
-
-    # ── abstract ────────────────────────────────────────────────────────────
 
     def _build_prompt(self, record: dict) -> str:
         raise NotImplementedError
 
-    # ── helpers ─────────────────────────────────────────────────────────────
-
     def _encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
 
-    # ── Dataset interface ────────────────────────────────────────────────────
-
     def __len__(self) -> int:
-        return len(self._items)
+        return len(self.records)
 
     def __getitem__(self, idx: int) -> Dict:
-        sample_idx, cand_idx = self._items[idx]
-        record = self.records[sample_idx]
-        lang   = record["_lang"]
-        gold   = record["_gold_cand_id"]
+        record = self.records[idx]
+        lang       = record["_lang"]
+        gold_label = record["_gold_label"]   # str
 
-        prompt_str = self._build_prompt(record)
-        cand_str   = self.candidates[cand_idx]   # e.g. " B" or " entailment"
-
-        prompt_ids = self._encode(prompt_str)
-        cand_ids   = self._encode(cand_str)
-
-        # Full sequence: BOS + prompt + candidate + EOS
-        full_ids = self.bos + prompt_ids + cand_ids + self.eos
-
+        prompt_ids = self._encode(self._build_prompt(record))
         # Truncate prompt từ trái nếu vượt budget
-        if len(full_ids) > self.max_length:
-            budget     = self.max_length - len(self.bos) - len(cand_ids) - len(self.eos)
-            prompt_ids = prompt_ids[-max(0, budget):]
-            full_ids   = self.bos + prompt_ids + cand_ids + self.eos
+        budget     = self.max_length - len(self.bos)
+        prompt_ids = prompt_ids[-max(0, budget):]
+        full_ids   = self.bos + prompt_ids
 
-        # Labels: -100 trên BOS + prompt; candidate + EOS là answer
-        prompt_len = len(self.bos) + len(prompt_ids)
-        labels     = [-100] * prompt_len + cand_ids + self.eos
-
-        assert len(full_ids) == len(labels)
-
-        return {
+        item = {
             "input_ids":      torch.tensor(full_ids, dtype=torch.long),
             "attention_mask": torch.ones(len(full_ids), dtype=torch.long),
-            "labels":         torch.tensor(labels,   dtype=torch.long),
-            "sample_id":      torch.tensor(sample_idx, dtype=torch.long),
-            "cand_id":        torch.tensor(cand_idx,   dtype=torch.long),
-            "gold_cand_id":   torch.tensor(gold,       dtype=torch.long),
+            "gold_label":     gold_label,
             "task":           self.task_name,
             "lang":           lang,
         }
 
+        # XSQuAD cần thêm tất cả gold answers cho F1/EM
+        if "answers" in record:
+            answers = record["answers"].get("text", [])
+            item["answers"] = [a.strip() for a in answers if a.strip()] or ["no answer"]
 
-# ---------------------------------------------------------------------------
-# MMMLU Dataset
-# ---------------------------------------------------------------------------
-
-class MMLUDownstreamDataset(_BaseCandidateDataset):
-    """
-    Dataset cho MMMLU log-prob evaluation.
-
-    Candidates: [" A", " B", " C", " D"]  (leading space → tránh tokenisation artifact)
-    gold_cand_id: MCQ_OPTIONS.index(record["Answer"])  e.g. "B" → 1
-    """
-    task_name = "mmmlu"
-
-    def __init__(
-        self,
-        records: List[dict],
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int = 512,
-    ) -> None:
-        # Candidates với leading space (chuẩn LM-Eval-Harness)
-        candidates = [f" {letter}" for letter in MCQ_OPTIONS]
-        super().__init__(records, candidates, tokenizer, max_length)
-
-    def _build_prompt(self, record: dict) -> str:
-        return _build_mmmlu_prompt(record)
-
-
-def _load_mmmlu(mmmlu_dir: Path) -> List[dict]:
-    """
-    Load tất cả ngôn ngữ từ MMMLU; inject _lang và _gold_cand_id vào mỗi record.
-    _gold_cand_id = MCQ_OPTIONS.index(answer_letter)   e.g. "B" → 1
-    """
-    records: List[dict] = []
-    lang_dirs = sorted(p for p in mmmlu_dir.iterdir() if p.is_dir())
-    if not lang_dirs:
-        print(f"[MMMLU] WARNING: no language sub-folders found in {mmmlu_dir}")
-        return records
-
-    for lang_dir in lang_dirs:
-        fpath = lang_dir / "test.json"
-        if not fpath.exists():
-            print(f"[MMMLU] WARNING: {fpath} not found, skipping.")
-            continue
-        raw   = _load_json(fpath)
-        valid = [
-            r for r in raw
-            if r.get("Answer", "").strip() in MCQ_OPTIONS and "Question" in r
-        ]
-        skipped = len(raw) - len(valid)
-        if skipped:
-            print(f"[MMMLU] {lang_dir.name}: skipped {skipped} malformed records.")
-        for r in valid:
-            r["_lang"]         = lang_dir.name
-            r["_gold_cand_id"] = MCQ_OPTIONS.index(r["Answer"].strip())
-        records.extend(valid)
-        print(f"[MMMLU] Loaded {len(valid):,} records from {lang_dir.name}/test.json")
-
-    return records
+        return item
 
 
 # ---------------------------------------------------------------------------
-# XNLI Dataset
+# Left-pad collate (dùng cho tất cả generation tasks)
 # ---------------------------------------------------------------------------
 
-class XNLIDataset(_BaseCandidateDataset):
-    """
-    Dataset cho XNLI log-prob evaluation.
+def _collate_fn_generation(batch: List[Dict], pad_token_id: int) -> Dict:
+    """Left-pad input_ids / attention_mask cho generation batches."""
+    max_len = max(s["input_ids"].size(0) for s in batch)
+    input_ids_list, mask_list = [], []
 
-    Candidates: [" entailment", " neutral", " contradiction"]
-    gold_cand_id: record["label"]  (0/1/2 đã map trực tiếp với XNLI_CANDIDATES)
-    """
-    task_name = "xnli"
+    for s in batch:
+        n   = s["input_ids"].size(0)
+        pad = max_len - n
+        input_ids_list.append(torch.cat([
+            torch.full((pad,), pad_token_id, dtype=torch.long),
+            s["input_ids"],
+        ]))
+        mask_list.append(torch.cat([
+            torch.zeros(pad, dtype=torch.long),
+            s["attention_mask"],
+        ]))
 
-    def __init__(
-        self,
-        records: List[dict],
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int = 256,
-    ) -> None:
-        candidates = [f" {w}" for w in XNLI_CANDIDATES]
-        super().__init__(records, candidates, tokenizer, max_length)
+    out = {
+        "input_ids":      torch.stack(input_ids_list),   # [B, L]
+        "attention_mask": torch.stack(mask_list),         # [B, L]
+        "gold_label":     [s["gold_label"] for s in batch],
+        "task":           [s["task"]        for s in batch],
+        "lang":           [s["lang"]        for s in batch],
+    }
 
-    def _build_prompt(self, record: dict) -> str:
-        return _build_xnli_prompt(record)
+    # Thêm answers nếu có (XSQuAD)
+    if "answers" in batch[0]:
+        out["answers"] = [s["answers"] for s in batch]
 
-
-def _load_xnli(xnli_dir: Path) -> List[dict]:
-    """
-    Load tất cả ngôn ngữ từ XNLI (test.json only — zero-shot eval).
-    Inject _lang và _gold_cand_id (= record["label"] ∈ {0,1,2}).
-    Records với label == -1 bị lọc.
-    """
-    records: List[dict] = []
-    lang_dirs = sorted(p for p in xnli_dir.iterdir() if p.is_dir())
-    if not lang_dirs:
-        print(f"[XNLI] WARNING: no language sub-folders found in {xnli_dir}")
-        return records
-
-    for lang_dir in lang_dirs:
-        fpath = lang_dir / "test.json"
-        if not fpath.exists():
-            print(f"[XNLI] WARNING: {fpath} not found, skipping.")
-            continue
-        raw     = _load_json(fpath)
-        valid   = [r for r in raw if r.get("label") in XNLI_LABEL_MAP]
-        skipped = len(raw) - len(valid)
-        if skipped:
-            print(f"[XNLI] {lang_dir.name}: skipped {skipped} records with label=-1.")
-        for r in valid:
-            r["_lang"]         = lang_dir.name
-            r["_gold_cand_id"] = r["label"]   # 0=entailment,1=neutral,2=contradiction
-        records.extend(valid)
-        print(f"[XNLI] Loaded {len(valid):,} records from {lang_dir.name}/test.json")
-
-    return records
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -385,13 +225,7 @@ def _load_xnli(xnli_dir: Path) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 class SortedLengthSampler(Sampler):
-    """
-    Bucket-based sampler — sort by proxy length để giảm padding.
-
-    Lưu ý: với multi-candidate dataset, ``lengths`` được tính theo sample gốc
-    (index s) và mở rộng theo thứ tự (s,0), (s,1), ..., (s,C-1) để đảm bảo
-    các candidates của cùng sample nằm cạnh nhau trong batch khi shuffle=False.
-    """
+    """Sort by prompt length để giảm padding trong batch."""
 
     def __init__(
         self,
@@ -425,71 +259,6 @@ class SortedLengthSampler(Sampler):
 
 
 # ---------------------------------------------------------------------------
-# Collate functions
-# ---------------------------------------------------------------------------
-
-def _collate_fn_candidates(batch: List[Dict], pad_token_id: int) -> Dict:
-    """
-    Right-pad input_ids / attention_mask / labels cho log-prob batches.
-
-    Trả thêm:
-        sample_id    LongTensor [B*C]
-        cand_id      LongTensor [B*C]
-        gold_cand_id LongTensor [B*C]
-    """
-    max_len = max(s["input_ids"].size(0) for s in batch)
-    input_ids_list, mask_list, labels_list = [], [], []
-
-    for s in batch:
-        n   = s["input_ids"].size(0)
-        pad = max_len - n
-        input_ids_list.append(torch.cat([
-            s["input_ids"], torch.full((pad,), pad_token_id, dtype=torch.long)
-        ]))
-        mask_list.append(torch.cat([
-            s["attention_mask"], torch.zeros(pad, dtype=torch.long)
-        ]))
-        labels_list.append(torch.cat([
-            s["labels"], torch.full((pad,), -100, dtype=torch.long)
-        ]))
-
-    return {
-        "input_ids":      torch.stack(input_ids_list),              # [B*C, L]
-        "attention_mask": torch.stack(mask_list),                    # [B*C, L]
-        "labels":         torch.stack(labels_list),                  # [B*C, L]
-        "sample_id":      torch.stack([s["sample_id"]   for s in batch]),  # [B*C]
-        "cand_id":        torch.stack([s["cand_id"]     for s in batch]),  # [B*C]
-        "gold_cand_id":   torch.stack([s["gold_cand_id"] for s in batch]), # [B*C]
-        "task":           [s["task"] for s in batch],
-        "lang":           [s["lang"] for s in batch],
-    }
-
-
-def _collate_fn_xsquad(batch: List[Dict], pad_token_id: int) -> Dict:
-    """Left-pad cho XSQuAD generation batches."""
-    max_len = max(s["input_ids"].size(0) for s in batch)
-    input_ids_list, mask_list = [], []
-    for s in batch:
-        n   = s["input_ids"].size(0)
-        pad = max_len - n
-        input_ids_list.append(torch.cat([
-            torch.full((pad,), pad_token_id, dtype=torch.long),
-            s["input_ids"],
-        ]))
-        mask_list.append(torch.cat([
-            torch.zeros(pad, dtype=torch.long),
-            s["attention_mask"],
-        ]))
-    return {
-        "input_ids":      torch.stack(input_ids_list),
-        "attention_mask": torch.stack(mask_list),
-        "answers":        [s["answers"] for s in batch],
-        "task":           [s["task"]    for s in batch],
-        "lang":           [s["lang"]    for s in batch],
-    }
-
-
-# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -502,37 +271,23 @@ def _get_tokenizer(tok: Optional[PreTrainedTokenizerBase]) -> PreTrainedTokenize
     return tok
 
 
-def _build_candidate_loader(
-    torch_ds: _BaseCandidateDataset,
+def _build_generation_loader(
+    torch_ds: _BaseGenerationDataset,
     batch_size: int,
     shuffle: bool,
     seed: int,
     num_workers: int,
     pin_memory: bool,
-    length_fn,          # Callable[[dict], int] — nhận record gốc
+    length_fn,
 ) -> tuple:
-    """
-    Build SortedLengthSampler + DataLoader cho multi-candidate dataset.
-
-    batch_size ở đây là số *sample gốc* per batch → DataLoader nhận
-    batch_size * num_candidates rows thực tế.
-
-    Sampler hoạt động trên self._items (len = N * C) nhưng lengths
-    được tính theo sample gốc để sort nhất quán.
-    """
-    C       = torch_ds.num_candidates
-    # Lengths theo từng item (s, c): dùng length của sample gốc
-    lengths = [
-        length_fn(torch_ds.records[s])
-        for s, _c in tqdm(torch_ds._items, desc="[Sampler] pre-computing lengths", leave=False)
-    ]
-    sampler = SortedLengthSampler(lengths, batch_size * C, shuffle, seed)
+    lengths = [length_fn(r) for r in torch_ds.records]
+    sampler = SortedLengthSampler(lengths, batch_size, shuffle, seed)
     pad_id  = torch_ds.tokenizer.pad_token_id
     loader  = DataLoader(
         torch_ds,
-        batch_size=batch_size * C,      # C rows per sample → batch_size samples per batch
+        batch_size=batch_size,
         sampler=sampler,
-        collate_fn=lambda b: _collate_fn_candidates(b, pad_token_id=pad_id),
+        collate_fn=lambda b: _collate_fn_generation(b, pad_token_id=pad_id),
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
@@ -541,42 +296,60 @@ def _build_candidate_loader(
 
 
 # ---------------------------------------------------------------------------
-# MMMLU DataLoader
+# MMMLU Dataset & DataLoader
 # ---------------------------------------------------------------------------
+
+class MMLUDownstreamDataset(_BaseGenerationDataset):
+    """
+    Generation-mode dataset cho MMMLU.
+    gold_label: "A" / "B" / "C" / "D"
+    """
+    task_name = "mmmlu"
+
+    def _build_prompt(self, record: dict) -> str:
+        return _build_mmmlu_prompt(record)
+
+
+def _load_mmmlu(mmmlu_dir: Path) -> List[dict]:
+    records: List[dict] = []
+    lang_dirs = sorted(p for p in mmmlu_dir.iterdir() if p.is_dir())
+    if not lang_dirs:
+        print(f"[MMMLU] WARNING: no language sub-folders found in {mmmlu_dir}")
+        return records
+
+    for lang_dir in lang_dirs:
+        fpath = lang_dir / "test.json"
+        if not fpath.exists():
+            print(f"[MMMLU] WARNING: {fpath} not found, skipping.")
+            continue
+        raw   = _load_json(fpath)
+        valid = [
+            r for r in raw
+            if r.get("Answer", "").strip() in MCQ_OPTIONS and "Question" in r
+        ]
+        skipped = len(raw) - len(valid)
+        if skipped:
+            print(f"[MMMLU] {lang_dir.name}: skipped {skipped} malformed records.")
+        for r in valid:
+            r["_lang"]       = lang_dir.name
+            r["_gold_label"] = r["Answer"].strip()   # "A" / "B" / "C" / "D"
+        records.extend(valid)
+        print(f"[MMMLU] Loaded {len(valid):,} records from {lang_dir.name}/test.json")
+
+    return records
+
 
 class MMLUDownstreamDataLoader:
     """
-    Evaluation DataLoader cho MMMLU — log-prob scoring với 4 candidates.
-
-    Mỗi batch chứa ``batch_size × 4`` rows (4 candidates per sample).
-    Dùng ``sample_id`` / ``cand_id`` / ``gold_cand_id`` để tính accuracy
-    sau khi collect toàn bộ mean-NLL scores (xem docstring module).
-
-    Parameters
-    ----------
-    data_root      : path đến raw_data/
-    tokenizer      : HF tokeniser; nếu None load DEFAULT_MODEL
-    batch_size     : số sample gốc per batch (thực tế = batch_size * 4 rows)
-    max_length     : độ dài tối đa sequence
-    shuffle        : shuffle (mặc định False cho eval)
-    seed           : RNG seed
-    num_workers    : DataLoader workers
-    pin_memory     : CUDA pin memory
-
-    Attributes
-    ----------
-    num_candidates : 4  (A / B / C / D)
+    Generation DataLoader cho MMMLU.
 
     Batch keys
     ----------
-    input_ids       LongTensor [B*4, L]
-    attention_mask  LongTensor [B*4, L]
-    labels          LongTensor [B*4, L]   -100 trên prompt; candidate token(s) + EOS
-    sample_id       LongTensor [B*4]      index sample gốc (0-indexed, global)
-    cand_id         LongTensor [B*4]      0=A, 1=B, 2=C, 3=D
-    gold_cand_id    LongTensor [B*4]      ground-truth candidate index
-    task            List[str]             ["mmmlu", ...]
-    lang            List[str]             language code
+    input_ids       LongTensor [B, L]   — prompt left-padded
+    attention_mask  LongTensor [B, L]
+    gold_label      List[str]           — "A" / "B" / "C" / "D"
+    task            List[str]           — ["mmmlu", ...]
+    lang            List[str]           — language code
     """
 
     def __init__(
@@ -592,19 +365,17 @@ class MMLUDownstreamDataLoader:
     ) -> None:
         mmmlu_dir = Path(data_root) / "downstream" / "MMMLU"
         records   = _load_mmmlu(mmmlu_dir)
-        self.tokenizer  = _get_tokenizer(tokenizer)
-        torch_ds = MMLUDownstreamDataset(records, self.tokenizer, max_length)
-        self._sampler, self._loader = _build_candidate_loader(
+        self.tokenizer = _get_tokenizer(tokenizer)
+        torch_ds  = MMLUDownstreamDataset(records, self.tokenizer, max_length)
+        self._sampler, self._loader = _build_generation_loader(
             torch_ds, batch_size, shuffle, seed, num_workers, pin_memory,
             length_fn=lambda r: len(r.get("Question", "")) + sum(
                 len(r.get(k, "")) for k in MCQ_OPTIONS
             ),
         )
-        self.num_candidates = torch_ds.num_candidates
         langs = sorted({r["_lang"] for r in records})
         print(
             f"[MMLUDownstreamDataLoader]  samples={len(records):,}  "
-            f"rows(×{self.num_candidates})={len(torch_ds):,}  "
             f"batches={len(self._loader):,}  batch_size={batch_size}\n"
             f"  languages ({len(langs)}): {langs}"
         )
@@ -624,42 +395,57 @@ class MMLUDownstreamDataLoader:
 
 
 # ---------------------------------------------------------------------------
-# XNLI DataLoader
+# XNLI Dataset & DataLoader
 # ---------------------------------------------------------------------------
+
+class XNLIDataset(_BaseGenerationDataset):
+    """
+    Generation-mode dataset cho XNLI.
+    gold_label: "entailment" / "neutral" / "contradiction"
+    """
+    task_name = "xnli"
+
+    def _build_prompt(self, record: dict) -> str:
+        return _build_xnli_prompt(record)
+
+
+def _load_xnli(xnli_dir: Path) -> List[dict]:
+    records: List[dict] = []
+    lang_dirs = sorted(p for p in xnli_dir.iterdir() if p.is_dir())
+    if not lang_dirs:
+        print(f"[XNLI] WARNING: no language sub-folders found in {xnli_dir}")
+        return records
+
+    for lang_dir in lang_dirs:
+        fpath = lang_dir / "test.json"
+        if not fpath.exists():
+            print(f"[XNLI] WARNING: {fpath} not found, skipping.")
+            continue
+        raw     = _load_json(fpath)
+        valid   = [r for r in raw if r.get("label") in XNLI_LABEL_MAP]
+        skipped = len(raw) - len(valid)
+        if skipped:
+            print(f"[XNLI] {lang_dir.name}: skipped {skipped} records with label=-1.")
+        for r in valid:
+            r["_lang"]       = lang_dir.name
+            r["_gold_label"] = XNLI_LABEL_MAP[r["label"]]  # "entailment" / "neutral" / "contradiction"
+        records.extend(valid)
+        print(f"[XNLI] Loaded {len(valid):,} records from {lang_dir.name}/test.json")
+
+    return records
+
 
 class XNLIDataLoader:
     """
-    Evaluation DataLoader cho XNLI — log-prob scoring với 3 candidates.
-
-    Mỗi batch chứa ``batch_size × 3`` rows (3 label words per sample).
-    Dùng ``sample_id`` / ``cand_id`` / ``gold_cand_id`` để tính accuracy
-    sau khi collect toàn bộ mean-NLL scores (xem docstring module).
-
-    Parameters
-    ----------
-    data_root      : path đến raw_data/
-    tokenizer      : HF tokeniser; nếu None load DEFAULT_MODEL
-    batch_size     : số sample gốc per batch (thực tế = batch_size * 3 rows)
-    max_length     : độ dài tối đa sequence
-    shuffle        : shuffle (mặc định False cho eval)
-    seed           : RNG seed
-    num_workers    : DataLoader workers
-    pin_memory     : CUDA pin memory
-
-    Attributes
-    ----------
-    num_candidates : 3  (entailment / neutral / contradiction)
+    Generation DataLoader cho XNLI.
 
     Batch keys
     ----------
-    input_ids       LongTensor [B*3, L]
-    attention_mask  LongTensor [B*3, L]
-    labels          LongTensor [B*3, L]   -100 trên prompt; label word token(s) + EOS
-    sample_id       LongTensor [B*3]      index sample gốc (0-indexed, global)
-    cand_id         LongTensor [B*3]      0=entailment, 1=neutral, 2=contradiction
-    gold_cand_id    LongTensor [B*3]      ground-truth candidate index
-    task            List[str]             ["xnli", ...]
-    lang            List[str]             language code
+    input_ids       LongTensor [B, L]   — prompt left-padded
+    attention_mask  LongTensor [B, L]
+    gold_label      List[str]           — "entailment" / "neutral" / "contradiction"
+    task            List[str]           — ["xnli", ...]
+    lang            List[str]           — language code
     """
 
     def __init__(
@@ -677,15 +463,13 @@ class XNLIDataLoader:
         records  = _load_xnli(xnli_dir)
         self.tokenizer = _get_tokenizer(tokenizer)
         torch_ds = XNLIDataset(records, self.tokenizer, max_length)
-        self._sampler, self._loader = _build_candidate_loader(
+        self._sampler, self._loader = _build_generation_loader(
             torch_ds, batch_size, shuffle, seed, num_workers, pin_memory,
             length_fn=lambda r: len(r.get("premise", "")) + len(r.get("hypothesis", "")),
         )
-        self.num_candidates = torch_ds.num_candidates
         langs = sorted({r["_lang"] for r in records})
         print(
             f"[XNLIDataLoader]  samples={len(records):,}  "
-            f"rows(×{self.num_candidates})={len(torch_ds):,}  "
             f"batches={len(self._loader):,}  batch_size={batch_size}\n"
             f"  languages ({len(langs)}): {langs}"
         )
@@ -705,50 +489,15 @@ class XNLIDataLoader:
 
 
 # ---------------------------------------------------------------------------
-# XSQuAD  (unchanged — generation mode)
+# XSQuAD Dataset & DataLoader
 # ---------------------------------------------------------------------------
 
-class XSQuADDataset(Dataset):
+class XSQuADDataset(_BaseGenerationDataset):
     """Generation-mode dataset cho XSQuAD."""
-
     task_name = "xsquad"
 
-    def __init__(
-        self,
-        records: List[dict],
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int = 1024,
-    ) -> None:
-        self.records    = records
-        self.tokenizer  = tokenizer
-        self.max_length = max_length
-        self.bos = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
-
-    def _encode(self, text: str) -> List[int]:
-        return self.tokenizer.encode(text, add_special_tokens=False)
-
-    def __len__(self) -> int:
-        return len(self.records)
-
-    def __getitem__(self, idx: int) -> Dict:
-        record = self.records[idx]
-        lang   = record["_lang"]
-
-        prompt_ids = self._encode(_build_xsquad_prompt(record))
-        budget     = self.max_length - len(self.bos)
-        prompt_ids = prompt_ids[-max(0, budget):]
-        full_ids   = self.bos + prompt_ids
-
-        answers = record["answers"].get("text", [])
-        answers = [a.strip() for a in answers if a.strip()] or ["no answer"]
-
-        return {
-            "input_ids":      torch.tensor(full_ids, dtype=torch.long),
-            "attention_mask": torch.ones(len(full_ids), dtype=torch.long),
-            "answers":        answers,
-            "task":           self.task_name,
-            "lang":           lang,
-        }
+    def _build_prompt(self, record: dict) -> str:
+        return _build_xsquad_prompt(record)
 
 
 def _load_xsquad(xsquad_dir: Path) -> List[dict]:
@@ -769,7 +518,8 @@ def _load_xsquad(xsquad_dir: Path) -> List[dict]:
         if skipped:
             print(f"[XSQuAD] {lang_dir.name}: skipped {skipped} malformed records.")
         for r in valid:
-            r["_lang"] = lang_dir.name
+            r["_lang"]       = lang_dir.name
+            r["_gold_label"] = (r["answers"].get("text") or ["no answer"])[0].strip()
         records.extend(valid)
         print(
             f"[XSQuAD] Loaded {len(valid):,} from {lang_dir.name}/validation.json "
@@ -779,7 +529,7 @@ def _load_xsquad(xsquad_dir: Path) -> List[dict]:
 
 
 class XSQuADDataLoader:
-    """Evaluation DataLoader cho XSQuAD — generation mode."""
+    """Generation DataLoader cho XSQuAD."""
 
     def __init__(
         self,
@@ -796,18 +546,9 @@ class XSQuADDataLoader:
         records    = _load_xsquad(xsquad_dir)
         self.tokenizer = _get_tokenizer(tokenizer)
         torch_ds   = XSQuADDataset(records, self.tokenizer, max_length)
-        lengths    = [len(r.get("context", "")) for r in records]
-        sampler    = SortedLengthSampler(lengths, batch_size, shuffle, seed)
-        pad_id     = self.tokenizer.pad_token_id
-        self._sampler = sampler
-        self._loader  = DataLoader(
-            torch_ds,
-            batch_size=batch_size,
-            sampler=sampler,
-            collate_fn=lambda b: _collate_fn_xsquad(b, pad_token_id=pad_id),
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=False,
+        self._sampler, self._loader = _build_generation_loader(
+            torch_ds, batch_size, shuffle, seed, num_workers, pin_memory,
+            length_fn=lambda r: len(r.get("context", "")),
         )
         langs = sorted({r["_lang"] for r in records})
         print(
@@ -828,58 +569,6 @@ class XSQuADDataLoader:
     @property
     def dataset(self) -> XSQuADDataset:
         return self._loader.dataset
-
-
-# ---------------------------------------------------------------------------
-# Utility: compute accuracy từ collected NLL scores
-# ---------------------------------------------------------------------------
-
-def compute_logprob_accuracy(
-    all_nll: torch.Tensor,       # [N_total]  float
-    all_sample_id: torch.Tensor, # [N_total]  long
-    all_cand_id: torch.Tensor,   # [N_total]  long
-    all_gold: torch.Tensor,      # [N_total]  long
-    num_candidates: int,
-    all_lang: Optional[List[str]] = None,
-) -> Dict:
-    """
-    Tính accuracy từ mean-NLL scores đã collect.
-
-    Returns dict:
-        overall_acc   : float
-        per_lang_acc  : Dict[str, float]  (nếu all_lang được cung cấp)
-    """
-    n_samples = int(all_sample_id.max().item()) + 1
-    C         = num_candidates
-
-    # Điền NLL matrix [N, C]
-    nll_mat  = torch.full((n_samples, C), float("inf"))
-    nll_mat[all_sample_id, all_cand_id] = all_nll.float()
-
-    # Gold labels [N]
-    gold_mat = torch.zeros(n_samples, dtype=torch.long)
-    gold_mat[all_sample_id] = all_gold
-
-    pred        = nll_mat.argmin(-1)                     # [N]
-    correct     = (pred == gold_mat)
-    overall_acc = correct.float().mean().item()
-
-    result: Dict = {"overall_acc": overall_acc}
-
-    if all_lang is not None:
-        # Map sample_id → lang (lấy lang đầu tiên của mỗi sample_id)
-        lang_of = [""] * n_samples
-        for sid, lg in zip(all_sample_id.tolist(), all_lang):
-            lang_of[sid] = lg
-        from collections import defaultdict
-        per_lang: Dict[str, List[bool]] = defaultdict(list)
-        for sid in range(n_samples):
-            per_lang[lang_of[sid]].append(correct[sid].item())
-        result["per_lang_acc"] = {
-            lg: sum(v) / len(v) for lg, v in sorted(per_lang.items())
-        }
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -908,99 +597,49 @@ if __name__ == "__main__":
     print(f"  vocab={tokenizer.vocab_size:,}  bos={tokenizer.bos_token_id}  "
           f"eos={tokenizer.eos_token_id}  pad={tokenizer.pad_token_id}\n")
 
-    # ── Log-prob loaders ─────────────────────────────────────────────────────
-    logprob_loaders = {
-        "MMMLU": MMLUDownstreamDataLoader(
-            data_root=DATA_ROOT, tokenizer=tokenizer, batch_size=8, max_length=512
-        ),
-        "XNLI":  XNLIDataLoader(
-            data_root=DATA_ROOT, tokenizer=tokenizer, batch_size=16, max_length=256
-        ),
+    loaders = {
+        "MMMLU":  MMLUDownstreamDataLoader(data_root=DATA_ROOT, tokenizer=tokenizer, batch_size=8),
+        "XNLI":   XNLIDataLoader(data_root=DATA_ROOT, tokenizer=tokenizer, batch_size=16),
+        "XSQuAD": XSQuADDataLoader(data_root=DATA_ROOT, tokenizer=tokenizer, batch_size=4),
     }
 
     print("\n" + "=" * 60)
-    print("Smoke-tests: MMMLU / XNLI (log-prob scoring)")
+    print("Smoke-tests: MMMLU / XNLI / XSQuAD (generation mode)")
     print("=" * 60)
-    for name, loader in logprob_loaders.items():
-        C     = loader.num_candidates
+
+    for name, loader in loaders.items():
         batch = next(iter(loader))
 
-        # ── Shape checks ────────────────────────────────────────────────────
         assert batch["input_ids"].dim()      == 2
         assert batch["attention_mask"].dim() == 2
-        assert batch["labels"].dim()         == 2
         assert batch["input_ids"].dtype      == torch.long
-        assert batch["labels"].dtype         == torch.long
-        assert (batch["labels"] == -100).any(),  f"{name}: no -100 prompt mask"
-        assert (batch["labels"] != -100).any(),  f"{name}: no candidate tokens"
-        assert "answers" not in batch,           f"{name}: should NOT have 'answers'"
+        assert "labels"     not in batch,  f"{name}: should NOT have labels"
+        assert "gold_label" in batch,      f"{name}: missing gold_label"
+        assert isinstance(batch["gold_label"], list)
+        assert isinstance(batch["gold_label"][0], str)
+        assert "lang"       in batch
+        assert "task"       in batch
 
-        # ── New fields ──────────────────────────────────────────────────────
-        assert "sample_id"    in batch
-        assert "cand_id"      in batch
-        assert "gold_cand_id" in batch
-        assert batch["sample_id"].dtype    == torch.long
-        assert batch["cand_id"].dtype      == torch.long
-        assert batch["gold_cand_id"].dtype == torch.long
-        assert batch["cand_id"].max().item() < C,             f"{name}: cand_id out of range"
-        assert batch["gold_cand_id"].max().item() < C,        f"{name}: gold out of range"
+        # Kiểm tra gold_label hợp lệ
+        if name == "MMMLU":
+            assert all(g in MCQ_OPTIONS for g in batch["gold_label"]), \
+                f"MMMLU: gold_label phải trong {MCQ_OPTIONS}"
+        elif name == "XNLI":
+            assert all(g in XNLI_CANDIDATES for g in batch["gold_label"]), \
+                f"XNLI: gold_label phải trong {XNLI_CANDIDATES}"
+        elif name == "XSQuAD":
+            assert "answers" in batch, "XSQuAD: missing answers"
+            assert all(isinstance(a, list) for a in batch["answers"])
 
-        print(f"  ✓ {name:6s}  shape={tuple(batch['input_ids'].shape)}  "
-              f"C={C}  task={batch['task'][0]}  langs={set(batch['lang'])}")
+        # In prompt đầu tiên
+        ids_0  = batch["input_ids"][0]
+        mask_0 = batch["attention_mask"][0]
+        prompt = tokenizer.decode(ids_0[mask_0 == 1], skip_special_tokens=True)
 
-        # ── In chi tiết sample đầu tiên (candidate 0) ────────────────────────
-        print(f"\n  {'─'*20} First sample of {name} (all {C} candidates) {'─'*20}")
-        # Tìm tất cả rows thuộc sample_id == 0
-        first_sid = batch["sample_id"].min().item()
-        mask_s0   = batch["sample_id"] == first_sid
-        indices   = mask_s0.nonzero(as_tuple=True)[0]
-        for row_i in indices:
-            ids_r    = batch["input_ids"][row_i]
-            labels_r = batch["labels"][row_i]
-            ans_mask = labels_r != -100
-            prompt_t = tokenizer.decode(ids_r[~ans_mask], skip_special_tokens=True)
-            cand_t   = tokenizer.decode(ids_r[ans_mask],  skip_special_tokens=True)
-            gold     = batch["gold_cand_id"][row_i].item()
-            cid      = batch["cand_id"][row_i].item()
-            marker   = " ← GOLD" if cid == gold else ""
-            print(f"  cand_id={cid}  answer='{cand_t}'{marker}")
-        # In prompt một lần
-        row0 = indices[0]
-        ids_r = batch["input_ids"][row0]
-        labels_r = batch["labels"][row0]
-        prompt_t = tokenizer.decode(ids_r[labels_r == -100], skip_special_tokens=True)
-        print(f"  lang={batch['lang'][0]}  seq_len={ids_r.size(0)}")
-        print(f"  PROMPT:\n{prompt_t}\n")
-
-    # ── XSQuAD ──────────────────────────────────────────────────────────────
-    xsquad_loader = XSQuADDataLoader(
-        data_root=DATA_ROOT, tokenizer=tokenizer, batch_size=4, max_length=1024
-    )
-    print("\n" + "=" * 60)
-    print("Smoke-tests: XSQuAD (generation)")
-    print("=" * 60)
-    batch = next(iter(xsquad_loader))
-
-    assert batch["input_ids"].dim()      == 2
-    assert batch["attention_mask"].dim() == 2
-    assert "labels"  not in batch,  "XSQuAD: should NOT have 'labels'"
-    assert "answers" in batch
-    assert isinstance(batch["answers"], list)
-    assert all(isinstance(a, list)       for a in batch["answers"])
-    assert all(isinstance(s, str) for a in batch["answers"] for s in a)
-    assert batch["input_ids"].dtype == torch.long
-    assert "lang" in batch
-    assert all(t == "xsquad" for t in batch["task"])
-
-    print(f"  ✓ XSQuAD  shape={tuple(batch['input_ids'].shape)}  "
-          f"task={batch['task'][0]}  langs={set(batch['lang'])}")
-    ids_0  = batch["input_ids"][0]
-    mask_0 = batch["attention_mask"][0]
-    real_t = tokenizer.decode(ids_0[mask_0 == 1], skip_special_tokens=True)
-    print(f"  lang={batch['lang'][0]}  seq_len={ids_0.size(0)}")
-    print(f"  PROMPT:\n{real_t}")
-    print(f"  ANSWERS: {batch['answers'][0]}")
-    assert real_t.strip().endswith("Answer:"), "XSQuAD: prompt should end with 'Answer:'"
+        print(f"\n  ✓ {name}  shape={tuple(batch['input_ids'].shape)}  "
+              f"task={batch['task'][0]}  langs={set(batch['lang'])}")
+        print(f"  gold_label[0] = '{batch['gold_label'][0]}'")
+        print(f"  PROMPT (trunc 300 chars):\n  {prompt[:300]!r}")
 
     print("\n" + "=" * 60)
     print("✓ All smoke-tests passed.")
