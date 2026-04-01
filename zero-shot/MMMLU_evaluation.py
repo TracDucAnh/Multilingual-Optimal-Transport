@@ -66,6 +66,7 @@ def load_model_and_tokenizer(dtype_str: str = "bf16"):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"   # ← thêm dòng này
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME, torch_dtype=dtype, device_map="auto",

@@ -314,8 +314,8 @@ def _get_tokenizer(tok: Optional[PreTrainedTokenizerBase]) -> PreTrainedTokenize
         print(f"[Tokenizer] Loading {DEFAULT_MODEL}")
         tok = AutoTokenizer.from_pretrained(DEFAULT_MODEL, use_fast=True)
     if tok.pad_token_id is None:
-        # Llama-3-Instruct: dùng eos_token_id làm pad (chuẩn HF)
         tok.pad_token_id = tok.eos_token_id
+    tok.padding_side = "left"   # ← thêm dòng này
     return tok
 
 
