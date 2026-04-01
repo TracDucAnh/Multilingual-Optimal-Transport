@@ -4,21 +4,36 @@ MMMLU_evaluation.py
 Zero-shot evaluation của Llama-3-8B (vanilla, không fine-tune) trên toàn bộ
 tập dữ liệu MMMLU — tất cả ngôn ngữ có sẵn.
 
-Scoring Strategy — Log-prob:
-    Mỗi sample được score bằng cách tính mean NLL của 4 candidate labels:
-        " A" / " B" / " C" / " D"
-    Prediction = candidate có NLL thấp nhất (log-prob cao nhất).
+Scoring Strategy — PMI Log-prob:
+    Mỗi sample được score bằng PMI (Pointwise Mutual Information):
+
+        pmi_score(c) = mean_nll(prompt + candidate_c)
+                     - mean_nll(null_prefix + candidate_c)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                prior NLL (không có context)
+
+    Prediction = candidate có PMI score thấp nhất.
+
+    Tại sao cần PMI cho MMMLU?
+    --------------------------
+    Candidates " A"/" B"/" C"/" D" đều là 1 token nên không bị bias độ dài.
+    Tuy nhiên Llama-3 vẫn có frequency bias — " A" xuất hiện đầu câu nhiều
+    hơn trong pre-training → prior NLL thấp hơn → model thiên về predict A.
+    PMI normalization loại bỏ bias này bằng cách trừ đi prior NLL của từng
+    candidate, đảm bảo evaluation fair và nhất quán với XNLI.
 
 Pipeline:
     1. Load MMLUDownstreamDataLoader  (log-prob mode, right-padded batches)
-    2. Forward pass → per-token CrossEntropyLoss
-    3. mean NLL per candidate → argmin → predicted label
-    4. Tính Accuracy per-lang + overall
+    2. Tính prior NLL của mỗi candidate label (1 forward pass nhỏ)
+    3. Forward pass → per-token CrossEntropyLoss
+    4. pmi_score = mean_nll - prior_nll → argmin → predicted label
+    5. Tính Accuracy per-lang + overall
 
 Kết quả lưu vào:
     results/mmmlu_vanilla/
         summary.json       — overall + per_lang accuracy
-        per_sample.jsonl   — từng sample: pred_label, gold_label, correct, nll scores
+        per_sample.jsonl   — từng sample: pred_label, gold_label, correct,
+                             nll (raw), pmi (normalized)
 
 Usage:
     python MMMLU_evaluation.py
@@ -59,6 +74,10 @@ MODEL_NAME = "meta-llama/Meta-Llama-3-8B"
 # cand_id:       0    1    2    3
 LABEL_NAMES = MCQ_OPTIONS  # ["A", "B", "C", "D"]
 
+# Null prefix để tính prior NLL — khớp với đuôi prompt trong dataloader
+# _build_mmmlu_prompt() kết thúc bằng "Answer:" nên dùng chuỗi này
+NULL_PREFIX = "Answer:"
+
 
 # ---------------------------------------------------------------------------
 # Model & Tokenizer
@@ -90,6 +109,76 @@ def load_model_and_tokenizer(dtype_str: str = "bf16"):
 
 
 # ---------------------------------------------------------------------------
+# PMI Prior Computation
+# ---------------------------------------------------------------------------
+
+def compute_prior_nll(
+    model,
+    tokenizer,
+    candidates: List[str],
+    null_prefix: str = NULL_PREFIX,
+) -> torch.Tensor:
+    """
+    Tính mean NLL của mỗi candidate khi không có question/options context.
+
+    Dùng null_prefix = "Answer:" (đuôi của prompt template) để prior
+    context khớp với vị trí candidate trong full prompt.
+
+    Token layout:
+        [BOS] <null_prefix tokens> <candidate tokens> [EOS]
+        labels: -100 ... -100       <candidate>       [EOS]
+
+    Returns
+    -------
+    prior_nll : FloatTensor [C]  — mean NLL per candidate
+    """
+    device   = next(model.parameters()).device
+    loss_fct = nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+
+    bos_ids = [tokenizer.bos_token_id] if tokenizer.bos_token_id is not None else []
+    eos_ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
+
+    prefix_ids = tokenizer.encode(null_prefix, add_special_tokens=False)
+    prior_nlls = []
+
+    print(f"\n[Prior] Computing prior NLL with null_prefix='{null_prefix}'")
+
+    for cand in candidates:
+        cand_ids = tokenizer.encode(cand, add_special_tokens=False)
+        full_ids = bos_ids + prefix_ids + cand_ids + eos_ids
+
+        # Labels: mask prefix, score candidate + EOS
+        prompt_len = len(bos_ids) + len(prefix_ids)
+        labels     = [-100] * prompt_len + cand_ids + eos_ids
+
+        input_tensor = torch.tensor([full_ids], dtype=torch.long, device=device)
+        label_tensor = torch.tensor([labels],   dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            out = model(input_ids=input_tensor)
+
+        shift_logits = out.logits[:, :-1].contiguous()      # [1, L-1, V]
+        shift_labels = label_tensor[:, 1:].contiguous()     # [1, L-1]
+
+        token_loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        ).view(shift_labels.size())                          # [1, L-1]
+
+        n_cand   = (shift_labels != -100).sum().clamp(min=1)
+        mean_nll = (token_loss.sum() / n_cand).item()
+        prior_nlls.append(mean_nll)
+
+        cand_decoded = tokenizer.decode(cand_ids)
+        print(f"  prior_nll('{cand_decoded}') = {mean_nll:.6f}  "
+              f"[{len(cand_ids)} token(s): {cand_ids}]")
+
+    prior_tensor = torch.tensor(prior_nlls, dtype=torch.float32)
+    print(f"[Prior] Done: {prior_tensor.tolist()}\n")
+    return prior_tensor   # [C]
+
+
+# ---------------------------------------------------------------------------
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
@@ -102,19 +191,29 @@ def evaluate(
     max_length: int = 512,
 ) -> Dict:
     """
-    Chạy toàn bộ log-prob evaluation trên MMMLU.
+    Chạy toàn bộ PMI log-prob evaluation trên MMMLU.
 
-    Log-prob scoring:
+    PMI scoring:
+        - Tính prior_nll[c] cho mỗi candidate (1 forward pass nhỏ)
         - Mỗi sample mở rộng thành 4 rows (C=4 candidates: A/B/C/D)
         - Forward pass → shift logits/labels → CrossEntropyLoss per token
         - mean_nll[i] = mean loss trên candidate tokens (ignore_index=-100)
-        - pred = argmin(mean_nll) trên C=4 candidates của cùng sample_id
+        - pmi_score[i] = mean_nll[i] - prior_nll[cand_id[i]]
+        - pred = argmin(pmi_score) trên C=4 candidates của cùng sample_id
 
     Returns
     -------
     summary : dict — overall + per_lang accuracy
     """
     device = next(model.parameters()).device
+
+    # ── Tính prior NLL trước (chỉ C=4 forward passes nhỏ) ────────────────
+    # Candidates trong dataloader có leading space: " A", " B", " C", " D"
+    # (xem MMLUDownstreamDataset.__init__: candidates = [f" {l}" for l in MCQ_OPTIONS])
+    candidates_with_space = [f" {letter}" for letter in LABEL_NAMES]
+    prior_nll = compute_prior_nll(
+        model, tokenizer, candidates_with_space, null_prefix=NULL_PREFIX
+    )  # FloatTensor [C]
 
     # ── DataLoader ────────────────────────────────────────────────────────
     loader = MMLUDownstreamDataLoader(
@@ -176,7 +275,7 @@ def evaluate(
 
     elapsed = time.time() - t0
 
-    # ── Aggregate NLL → predictions ───────────────────────────────────────
+    # ── Aggregate NLL → PMI scores → predictions ──────────────────────────
     all_nll       = torch.cat(all_nll)        # [N_total]
     all_sample_id = torch.cat(all_sample_id)  # [N_total]
     all_cand_id   = torch.cat(all_cand_id)    # [N_total]
@@ -184,9 +283,12 @@ def evaluate(
 
     n_samples = int(all_sample_id.max().item()) + 1
 
-    # NLL matrix [n_samples, C]
+    # Raw NLL matrix [n_samples, C]
     nll_mat = torch.full((n_samples, C), float("inf"))
     nll_mat[all_sample_id, all_cand_id] = all_nll.float()
+
+    # PMI score = mean_nll - prior_nll  (broadcast prior [C] → [n_samples, C])
+    pmi_mat = nll_mat - prior_nll.unsqueeze(0)   # [n_samples, C]
 
     # Gold labels [n_samples]
     gold_mat = torch.zeros(n_samples, dtype=torch.long)
@@ -198,7 +300,8 @@ def evaluate(
         if lang_of[sid] == "":
             lang_of[sid] = lg
 
-    pred    = nll_mat.argmin(-1)          # [n_samples]
+    # Predict bằng PMI (thấp nhất = tốt nhất)
+    pred    = pmi_mat.argmin(-1)          # [n_samples]
     correct = (pred == gold_mat)          # [n_samples] bool
 
     print(f"\n[Eval] Finished {n_samples:,} samples in {elapsed:.1f}s "
@@ -213,8 +316,14 @@ def evaluate(
                 "pred_label": LABEL_NAMES[int(pred[sid].item())],
                 "gold_label": LABEL_NAMES[int(gold_mat[sid].item())],
                 "correct":    bool(correct[sid].item()),
-                "nll":        {
+                # Raw NLL scores
+                "nll": {
                     LABEL_NAMES[c]: round(nll_mat[sid, c].item(), 6)
+                    for c in range(C)
+                },
+                # PMI-normalized scores (dùng để predict)
+                "pmi": {
+                    LABEL_NAMES[c]: round(pmi_mat[sid, c].item(), 6)
                     for c in range(C)
                 },
             }
@@ -228,7 +337,7 @@ def evaluate(
     per_lang_summary: Dict[str, Dict] = {}
 
     print(f"\n{'═'*58}")
-    print(f"  MMMLU Zero-shot Results — {MODEL_NAME}")
+    print(f"  MMMLU Zero-shot Results (PMI) — {MODEL_NAME}")
     print(f"{'═'*58}")
     print(f"  {'Language':<14}  {'N':>6}  {'Accuracy (%)':>13}")
     print(f"  {'─'*14}  {'─'*6}  {'─'*13}")
@@ -247,24 +356,29 @@ def evaluate(
     print(f"  Random baseline: 25.00%  |  Evaluated: {overall_acc:.2f}%")
     print(f"{'═'*58}\n")
 
-    # ── Label distribution of predictions (bias check) ───────────────────
-    pred_dist = {
-        LABEL_NAMES[c]: int((pred == c).sum().item())
-        for c in range(C)
-    }
-    gold_dist = {
-        LABEL_NAMES[c]: int((gold_mat == c).sum().item())
-        for c in range(C)
-    }
+    # ── Label distribution của predictions và gold (bias check) ──────────
+    pred_dist = {LABEL_NAMES[c]: int((pred == c).sum().item())     for c in range(C)}
+    gold_dist = {LABEL_NAMES[c]: int((gold_mat == c).sum().item()) for c in range(C)}
+
+    print(f"  Prediction distribution (bias check):")
+    print(f"  {'Label':<6}  {'Pred':>8}  {'Gold':>8}  {'Expected':>8}")
+    expected = n_samples // C
+    for c in range(C):
+        lbl = LABEL_NAMES[c]
+        print(f"  {lbl:<6}  {pred_dist[lbl]:>8,}  {gold_dist[lbl]:>8,}  {expected:>8,}")
+    print()
 
     # ── Build summary ─────────────────────────────────────────────────────
     summary = {
         "model":     MODEL_NAME,
         "task":      "MMMLU",
-        "mode":      "zero-shot log-prob scoring",
+        "mode":      "zero-shot PMI log-prob scoring",
         "n_samples": n_samples,
         "candidates": LABEL_NAMES,
         "random_baseline": 25.0,
+        "prior_nll": {
+            LABEL_NAMES[c]: round(prior_nll[c].item(), 6) for c in range(C)
+        },
         "overall": {
             "accuracy": round(overall_acc, 2),
         },
@@ -272,8 +386,9 @@ def evaluate(
         "prediction_distribution": pred_dist,
         "gold_distribution":       gold_dist,
         "eval_config": {
-            "max_length": max_length,
-            "batch_size": batch_size,
+            "max_length":  max_length,
+            "batch_size":  batch_size,
+            "null_prefix": NULL_PREFIX,
         },
         "elapsed_seconds": round(elapsed, 1),
     }
@@ -295,7 +410,7 @@ def evaluate(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="MMMLU zero-shot evaluation — Llama-3-8B vanilla baseline"
+        description="MMMLU zero-shot PMI evaluation — Llama-3-8B vanilla baseline"
     )
     parser.add_argument(
         "--data_root", type=str, default="../raw_data/",
@@ -318,6 +433,10 @@ def parse_args() -> argparse.Namespace:
         choices=["bf16", "fp16", "fp32"],
         help="Model dtype (default: bf16)"
     )
+    parser.add_argument(
+        "--null_prefix", type=str, default=NULL_PREFIX,
+        help=f"Null prefix để tính prior NLL (default: '{NULL_PREFIX}')"
+    )
     return parser.parse_args()
 
 
@@ -327,6 +446,10 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+
+    # Override NULL_PREFIX nếu user truyền vào
+    import MMMLU_evaluation as _self
+    _self.NULL_PREFIX = args.null_prefix
 
     # HuggingFace login nếu cần
     load_dotenv()
