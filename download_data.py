@@ -29,15 +29,15 @@ the dataset/config is skipped entirely (no re-download).
 Usage:
     pip install datasets tqdm
     python download_data.py
+    python download_data.py --root /data/my_project/raw_data
 """
 
+import argparse
 import os
 import json
 from datasets import load_dataset, get_dataset_config_names
 from dotenv import load_dotenv
 from tqdm import tqdm
-
-ROOT = "raw_data"
 
 from huggingface_hub import login
 load_dotenv()
@@ -45,6 +45,27 @@ load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
 if hf_token:
     login(token=hf_token)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download all Multilingual OT datasets to a local directory."
+    )
+    parser.add_argument(
+        "--root",
+        type=str,
+        default="raw_data",
+        help=(
+            "Root directory to save all downloaded data. "
+            "Default: raw_data"
+        ),
+    )
+    return parser.parse_args()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -73,7 +94,7 @@ def save_dataset(ds_dict, base_dir: str):
 # Stage 1 – English Datasets
 # ─────────────────────────────────────────────────────────────────────────────
 
-def download_squad():
+def download_squad(ROOT: str):
     out = os.path.join(ROOT, "english", "SQuAD")
     print("\n━━  SQuAD v2  ━━")
     if already_downloaded(out):
@@ -83,7 +104,7 @@ def download_squad():
     save_dataset(ds, out)
 
 
-def download_snli():
+def download_snli(ROOT: str):
     out = os.path.join(ROOT, "english", "SNLI")
     print("\n━━  SNLI  ━━")
     if already_downloaded(out):
@@ -93,7 +114,7 @@ def download_snli():
     save_dataset(ds, out)
 
 
-def download_mmlu():
+def download_mmlu(ROOT: str):
     out = os.path.join(ROOT, "english", "MMLU")
     print("\n━━  MMLU  ━━")
     if already_downloaded(out):
@@ -107,16 +128,7 @@ def download_mmlu():
 # Stage 2 – Alignment Datasets
 # ─────────────────────────────────────────────────────────────────────────────
 
-def download_flores200():
-    """FLORES+ via openlanguagedata/flores_plus (parquet-native, no legacy script).
-
-    This is the actively maintained successor to FLORES-200 by OLDI / Meta FAIR.
-    Loading without a config returns all 200+ languages in dev + devtest splits.
-    Saved as raw_data/alignment/FLORES-200/{dev,devtest}.json
-
-    NOTE: facebook/flores and Muennighoff/flores200 both rely on legacy .py
-    dataset scripts which are no longer supported in datasets >= 3.x.
-    """
+def download_flores200(ROOT: str):
     out = os.path.join(ROOT, "alignment", "FLORES-200")
     print("\n━━  FLORES-200 / FLORES+ (all languages — openlanguagedata/flores_plus)  ━━")
     if already_downloaded(out):
@@ -146,7 +158,7 @@ OPUS100_PAIRS = [
 ]
 
 
-def download_opus100():
+def download_opus100(ROOT: str):
     """OPUS-100: 99 English-centric language pairs."""
     base = os.path.join(ROOT, "alignment", "OPUS-100")
     print(f"\n━━  OPUS-100 ({len(OPUS100_PAIRS)} language pairs)  ━━")
@@ -174,7 +186,7 @@ def download_opus100():
 XQUAD_LANGS = ["ar", "de", "el", "en", "es", "hi", "ro", "ru", "th", "tr", "vi", "zh"]
 
 
-def download_xquad():
+def download_xquad(ROOT: str):
     base = os.path.join(ROOT, "downstream", "XSQuAD")
     print(f"\n━━  XSQuAD / XQuAD ({len(XQUAD_LANGS)} languages)  ━━")
 
@@ -200,7 +212,7 @@ XNLI_LANGS = [
 ]
 
 
-def download_xnli():
+def download_xnli(ROOT: str):
     base = os.path.join(ROOT, "downstream", "XNLI")
     print(f"\n━━  XNLI ({len(XNLI_LANGS)} languages)  ━━")
 
@@ -220,7 +232,7 @@ def download_xnli():
             tqdm.write(f"  [WARN] XNLI '{lang}': {e}")
 
 
-def download_mmmlu():
+def download_mmmlu(ROOT: str):
     """MMMLU: auto-discovers all available language configs at runtime."""
     base = os.path.join(ROOT, "downstream", "MMMLU")
     print("\n━━  MMMLU (all available language configs)  ━━")
@@ -257,24 +269,27 @@ def download_mmmlu():
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    args = parse_args()
+    ROOT = args.root
+
     print("=" * 60)
     print("  Multilingual OT — Dataset Download Script")
     print(f"  Output root: {os.path.abspath(ROOT)}")
     print("=" * 60)
 
     # ── Stage 1: English ──────────────────────────────────────────────────
-    download_squad()
-    download_snli()
-    download_mmlu()
+    download_squad(ROOT)
+    download_snli(ROOT)
+    download_mmlu(ROOT)
 
     # ── Stage 2: Alignment ────────────────────────────────────────────────
-    download_flores200()
-    download_opus100()
+    download_flores200(ROOT)
+    download_opus100(ROOT)
 
     # ── Downstream Tasks ──────────────────────────────────────────────────
-    download_xquad()
-    download_xnli()
-    download_mmmlu()
+    download_xquad(ROOT)
+    download_xnli(ROOT)
+    download_mmmlu(ROOT)
 
     print("\n" + "=" * 60)
     print("  ✅  All downloads complete.")
