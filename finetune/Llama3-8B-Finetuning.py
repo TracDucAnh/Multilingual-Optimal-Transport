@@ -5,8 +5,8 @@ Full-model supervised fine-tuning của meta-llama/Meta-Llama-3-8B-Instruct
 trên ba English benchmark datasets (MMLU, SQuAD, SNLI) với:
 
   - Generate mode + L_LM loss (CrossEntropy trên answer tokens)
-  - Chạy TUẦN TỰ từng task: MMLU → SQuAD → SNLI (không mix)
-  - 1 SequentialTaskDataLoader duy nhất với adaptive batch size (OOM → giảm ½)
+  - Mixed batch: mỗi batch chứa samples từ CẢ 3 task cùng lúc
+  - MixedTaskDataLoader với adaptive batch size (OOM → giảm ½ toàn bộ)
   - Resume tự động: check HF Hub → load training_state.json → skip epoch đã xong
   - Mỗi epoch push HF Hub kèm training_state.json + optimizer checkpoint
   - Per-iteration logging ra file .jsonl
@@ -18,7 +18,7 @@ Resume đầy đủ bao gồm:
   - Optimizer state dict  → optimizer_state.pt  (upload lên Hub)
   - Scheduler state dict  → scheduler_state.pt  (upload lên Hub)
   - GradScaler state dict → scaler_state.pt     (upload lên Hub)
-  - training_state.json   → global_step, loss_log, epoch_results, batch_sizes
+  - training_state.json   → global_step, loss_log, epoch_results, batch_size
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Last-N Layers Finetuning
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -38,14 +38,14 @@ Last-N Layers Finetuning
 Usage
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Recommended cho 80GB — train 8 layers cuối
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    python Llama3-8B-Finetuning.py \
-        --data_root   ../raw_data/english/ \
-        --output_dir  ./checkpoints \
-        --hub_repo    Llama3-8B-Finetune \
-        --epochs      3 \
-        --batch_size  16 \
-        --lr          2e-5 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
+    python Llama3-8B-Finetuning.py \\
+        --data_root   ../raw_data/english/ \\
+        --output_dir  ./checkpoints \\
+        --hub_repo    Llama3-8B-Finetune \\
+        --epochs      3 \\
+        --batch_size  16 \\
+        --lr          2e-5 \\
         --freeze_layers 8
 """
 
@@ -74,7 +74,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "dataloader"))
 
 from finetune_dataloader import (
-    SequentialTaskDataLoader,
+    MixedTaskDataLoader,
+    SequentialTaskDataLoader,   # alias, same class
     MMLUValDataLoader,
     SNLIValDataLoader,
     SQuADValDataLoader,
@@ -113,7 +114,7 @@ LOSS_LOG_FILE        = "loss_log.json"
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Llama-3-8B Last-N Layers Finetune")
+    parser = argparse.ArgumentParser(description="Llama-3-8B Last-N Layers Finetune (Mixed Batch)")
 
     parser.add_argument("--data_root",        type=str,   default="../raw_data/english/")
     parser.add_argument("--output_dir",       type=str,   default="./checkpoints")
@@ -318,10 +319,10 @@ def load_optimizer_states(
     scheduler,
     scaler: GradScaler,
     device: torch.device,
-) -> None:
+) -> List[Dict]:
     """
     Download và load optimizer / scheduler / scaler state dicts từ Hub.
-    Nếu file không tồn tại thì bỏ qua (fresh start cho optimizer đó).
+    Trả về loss_log (list) nếu có, ngược lại trả về [].
     """
     # --- Optimizer ---
     opt_path = _download_hub_file(hub_repo, OPTIMIZER_STATE_FILE)
@@ -378,7 +379,6 @@ def _upload_file_to_hub(
     repo_filename: str,
     commit_msg: str,
 ) -> None:
-    """Upload một file lên Hub — bọc exception để không crash training."""
     try:
         HfApi().upload_file(
             path_or_fileobj=str(local_path),
@@ -404,17 +404,6 @@ def save_and_push_checkpoint(
     epoch: int,
     private: bool,
 ) -> None:
-    """
-    Lưu tất cả state dict cần thiết để resume hoàn toàn, rồi push lên Hub.
-
-    Files được push:
-      - model weights + tokenizer  (push_to_hub)
-      - training_state.json        (metadata + epoch_results + global_step)
-      - optimizer_state.pt         (AdamW momentum buffers)
-      - scheduler_state.pt         (cosine schedule state)
-      - scaler_state.pt            (AMP loss scale)
-      - loss_log.json              (per-step loss history)
-    """
     commit_base = f"epoch-{epoch}"
     _ensure_repo_exists(hub_repo, private)
 
@@ -424,7 +413,7 @@ def save_and_push_checkpoint(
         json.dump(state, f, indent=2, ensure_ascii=False)
     logger.info(f"[State] Saved → {state_path}")
 
-    # 2. optimizer_state.pt  — save lên CPU để tiết kiệm bộ nhớ khi load
+    # 2. optimizer_state.pt
     opt_path = output_dir / OPTIMIZER_STATE_FILE
     torch.save(optimizer.state_dict(), opt_path)
     logger.info(f"[State] Optimizer state → {opt_path}  ({opt_path.stat().st_size / 1e6:.1f} MB)")
@@ -702,13 +691,13 @@ def train(args: argparse.Namespace) -> None:
     if is_resuming:
         completed_epochs  = training_state.get("completed_epochs", [])
         epoch_results     = training_state.get("epoch_results", [])
-        saved_batch_sizes = training_state.get("batch_sizes", {})
-        # FIX: khôi phục global_step để loss_log liên tục
+        # batch_size được lưu là global batch_size (không phải sub-batch per task)
+        saved_batch_size  = training_state.get("batch_size", args.batch_size)
         saved_global_step = training_state.get("global_step", 0)
         logger.info(
             f"[Resume] Completed: {completed_epochs} | "
             f"global_step: {saved_global_step} | "
-            f"BS: {saved_batch_sizes}"
+            f"global_batch_size: {saved_batch_size}"
         )
         tokenizer = AutoTokenizer.from_pretrained(hub_repo, use_fast=True)
         model     = AutoModelForCausalLM.from_pretrained(
@@ -716,10 +705,11 @@ def train(args: argparse.Namespace) -> None:
             device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True,
         )
+        # Restore batch_size từ checkpoint
+        args.batch_size = saved_batch_size
     else:
         completed_epochs  = []
         epoch_results     = []
-        saved_batch_sizes = {}
         saved_global_step = 0
         logger.info(f"[Setup] Loading {args.model_name}")
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
@@ -736,7 +726,7 @@ def train(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         model = model.to(device)
 
-    # ── Freeze layers (TRƯỚC gradient_checkpointing_enable) ───────────────────
+    # ── Freeze layers ──────────────────────────────────────────────────────────
     if args.freeze_layers > 0:
         freeze_model_layers(model, n_train_layers=args.freeze_layers)
     else:
@@ -754,9 +744,9 @@ def train(args: argparse.Namespace) -> None:
     else:
         logger.info("[Setup] Gradient checkpointing: OFF")
 
-    # ── DataLoader ────────────────────────────────────────────────────────────
-    logger.info("[Setup] Building SequentialTaskDataLoader...")
-    train_loader = SequentialTaskDataLoader(
+    # ── DataLoader (Mixed Batch) ───────────────────────────────────────────────
+    logger.info("[Setup] Building MixedTaskDataLoader...")
+    train_loader = MixedTaskDataLoader(
         data_root=args.data_root,
         tokenizer=tokenizer,
         initial_batch_size=args.batch_size,
@@ -768,14 +758,6 @@ def train(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
-
-    if saved_batch_sizes:
-        for task, bs in saved_batch_sizes.items():
-            if task in train_loader.current_batch_sizes:
-                old = train_loader.current_batch_sizes[task]
-                train_loader.current_batch_sizes[task] = bs
-                if bs != old:
-                    logger.info(f"[Resume] batch_size[{task}]: {old} → {bs}")
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
     no_decay = {"bias", "LayerNorm.weight", "layer_norm.weight"}
@@ -798,7 +780,7 @@ def train(args: argparse.Namespace) -> None:
 
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, eps=1e-8, betas=(0.9, 0.95))
 
-    steps_per_epoch = len(train_loader)
+    steps_per_epoch = len(train_loader)   # min-limited by shortest task
     total_opt_steps = steps_per_epoch * args.epochs
     warmup_steps    = max(1, int(total_opt_steps * args.warmup_ratio))
     scheduler       = get_cosine_schedule_with_warmup(
@@ -806,10 +788,13 @@ def train(args: argparse.Namespace) -> None:
     )
     scaler = GradScaler(device="cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
-    logger.info(f"[Setup] steps/epoch≈{steps_per_epoch}  total≈{total_opt_steps}  warmup={warmup_steps}")
+    logger.info(
+        f"[Setup] steps/epoch≈{steps_per_epoch}  total≈{total_opt_steps}  warmup={warmup_steps}\n"
+        f"        sub-batch sizes: "
+        + ", ".join(f"{t}={train_loader.current_batch_sizes[t]}" for t in TASK_ORDER)
+    )
 
     # ── Resume optimizer/scheduler/scaler states ──────────────────────────────
-    # FIX: phải load SAU khi khởi tạo optimizer + scheduler + scaler
     if is_resuming:
         loss_log = load_optimizer_states(hub_repo, optimizer, scheduler, scaler, device)
         if not isinstance(loss_log, list):
@@ -818,14 +803,9 @@ def train(args: argparse.Namespace) -> None:
             f"[Resume] Optimizer LR after load: "
             f"{[pg['lr'] for pg in optimizer.param_groups]}"
         )
-        logger.info(
-            f"[Resume] Scheduler last_epoch={scheduler.last_epoch}  "
-            f"lr={scheduler.get_last_lr() if scheduler.last_epoch > 0 else 'not started'}"
-        )
     else:
         loss_log = []
 
-    # FIX: khôi phục global_step từ saved state
     global_step = saved_global_step
 
     # ── Logging setup ─────────────────────────────────────────────────────────
@@ -846,34 +826,29 @@ def train(args: argparse.Namespace) -> None:
             continue
 
         logger.info(f"\n{'='*60}")
-        logger.info(f"EPOCH {epoch}/{args.epochs}  ({' → '.join(TASK_ORDER)})")
+        logger.info(f"EPOCH {epoch}/{args.epochs}  (mixed: {' + '.join(TASK_ORDER)})")
         logger.info(f"{'='*60}")
 
         train_loader.set_epoch(epoch)
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        batch_pbar = tqdm(desc=f"  Epoch {epoch} | task=?",
-                          total=len(train_loader), unit="batch",
-                          dynamic_ncols=True, leave=False)
+        batch_pbar = tqdm(
+            desc=f"  Epoch {epoch} | mixed batch",
+            total=len(train_loader),
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        )
 
         running_loss   = 0.0
         running_count  = 0
-        current_task   = None
         oom_skip_count = 0
 
         for batch in train_loader:
-            task = batch["task"][0]
-
-            if task != current_task:
-                if current_task is not None:
-                    logger.info(f"\n[Train] ✓ '{current_task.upper()}' done epoch {epoch}.")
-                current_task = task
-                logger.info(f"\n[Train] ▶ {task.upper()}  "
-                             f"bs={train_loader.current_batch_sizes[task]}  epoch={epoch}")
-                batch_pbar.set_description(f"  Epoch {epoch} | task={task.upper()}")
-                batch_pbar.total = len(train_loader)
-                batch_pbar.refresh()
+            # batch["task"] is a list like ["mmlu", "squad", "snli", "mmlu", ...]
+            # Summarise task composition for logging
+            task_list = batch["task"]
 
             if oom_skip_count > 0:
                 oom_skip_count -= 1
@@ -889,9 +864,12 @@ def train(args: argparse.Namespace) -> None:
             loss    = None
             try:
                 with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask,
-                                    use_cache=False)
-                    loss    = compute_lm_loss(outputs.logits, labels)
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                    )
+                    loss = compute_lm_loss(outputs.logits, labels)
 
                 if use_amp and amp_dtype == torch.float16:
                     scaler.scale(loss).backward()
@@ -906,18 +884,24 @@ def train(args: argparse.Namespace) -> None:
                     raise
                 _cleanup_after_oom(optimizer, outputs, loss, input_ids, attention_mask, labels)
                 try:
-                    new_bs = train_loader.report_oom(task)
+                    # report_oom reduces global batch_size and recomputes sub-batch sizes
+                    new_global_bs  = train_loader.report_oom(task_list[0] if task_list else "mixed")
                     oom_skip_count = args.oom_skip_batches
-                    logger.warning(f"[OOM] task={task} bs→{new_bs} skip={oom_skip_count}")
-                    batch_pbar.total = len(train_loader)
-                    batch_pbar.refresh()
+                    logger.warning(
+                        f"[OOM] global_bs→{new_global_bs}  "
+                        f"sub-bs: "
+                        + ", ".join(f"{t}={train_loader.current_batch_sizes[t]}" for t in TASK_ORDER)
+                        + f"  skip={oom_skip_count}"
+                    )
+                    # Update batch_size in args so it's saved to state correctly
+                    args.batch_size = new_global_bs
                 except RuntimeError as re:
-                    logger.error(f"[OOM] Không thể giảm bs thêm: {re}")
+                    logger.error(f"[OOM] Không thể giảm batch_size thêm: {re}")
                     raise
                 batch_pbar.update(1)
                 continue
 
-            # Optimizer step
+            # ── Optimizer step ────────────────────────────────────────────────
             if use_amp and amp_dtype == torch.float16:
                 scaler.unscale_(optimizer)
 
@@ -940,11 +924,19 @@ def train(args: argparse.Namespace) -> None:
             current_lr    = scheduler.get_last_lr()[0]
             running_loss  = running_count = 0
 
+            # Count tasks in this batch for logging
+            from collections import Counter as _Counter
+            task_counts = dict(_Counter(task_list))
+
             log_entry = {
-                "epoch": epoch, "step": global_step, "task": task,
-                "loss": round(avg_loss, 6), "lr": current_lr,
-                "grad_norm": round(float(grad_norm), 4),
-                "bs": train_loader.current_batch_sizes[task],
+                "epoch":      epoch,
+                "step":       global_step,
+                "tasks":      task_counts,             # e.g. {"mmlu": 6, "squad": 5, "snli": 5}
+                "batch_size": len(task_list),
+                "loss":       round(avg_loss, 6),
+                "lr":         current_lr,
+                "grad_norm":  round(float(grad_norm), 4),
+                "sub_bs":     dict(train_loader.current_batch_sizes),
             }
             log_file.write(json.dumps(log_entry) + "\n")
             log_file.flush()
@@ -952,18 +944,21 @@ def train(args: argparse.Namespace) -> None:
 
             batch_pbar.update(1)
             batch_pbar.set_postfix(
-                task=task, loss=f"{avg_loss:.4f}", lr=f"{current_lr:.2e}",
-                grad=f"{float(grad_norm):.3f}", bs=train_loader.current_batch_sizes[task],
+                bs=len(task_list),
+                loss=f"{avg_loss:.4f}",
+                lr=f"{current_lr:.2e}",
+                grad=f"{float(grad_norm):.3f}",
             )
-            epoch_pbar.set_postfix(epoch=f"{epoch}/{args.epochs}",
-                                   step=global_step, loss=f"{avg_loss:.4f}")
+            epoch_pbar.set_postfix(
+                epoch=f"{epoch}/{args.epochs}",
+                step=global_step,
+                loss=f"{avg_loss:.4f}",
+            )
 
         batch_pbar.close()
-        if current_task:
-            logger.info(f"\n[Train] ✓ '{current_task.upper()}' done (epoch {epoch}).")
-        logger.info(f"\n[Epoch {epoch}] Training done.")
+        logger.info(f"\n[Epoch {epoch}] Training done.  global_step={global_step}")
 
-        # Eval
+        # ── Eval ──────────────────────────────────────────────────────────────
         if not args.skip_eval:
             eval_res = run_evaluation(
                 model, tokenizer, args, device, amp_dtype, use_amp, epoch, output_dir,
@@ -972,7 +967,7 @@ def train(args: argparse.Namespace) -> None:
             plot_metrics(epoch_results, output_dir)
             plot_training_loss(loss_log, output_dir)
 
-        # Save & push  — FIX: truyền đủ optimizer/scheduler/scaler + global_step
+        # ── Save & push ───────────────────────────────────────────────────────
         completed_epochs.append(epoch)
         state = {
             "model_name":       args.model_name,
@@ -980,19 +975,20 @@ def train(args: argparse.Namespace) -> None:
             "total_epochs":     args.epochs,
             "completed_epochs": completed_epochs,
             "freeze_layers":    args.freeze_layers,
-            "batch_sizes":      dict(train_loader.current_batch_sizes),
+            # Save global batch_size (sub-batch sizes are derived from this)
+            "batch_size":       args.batch_size,
+            "sub_batch_sizes":  dict(train_loader.current_batch_sizes),
             "lr":               args.lr,
             "seed":             args.seed,
             "epoch_results":    epoch_results,
-            # FIX: lưu global_step để resume chính xác
             "global_step":      global_step,
             "timestamp":        time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         ckpt_path = output_dir / f"checkpoint_epoch{epoch}"
+        ckpt_path.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(str(ckpt_path))
         tokenizer.save_pretrained(str(ckpt_path))
-        # FIX: cũng lưu optimizer state vào checkpoint local để có thể load offline
         torch.save(optimizer.state_dict(), ckpt_path / OPTIMIZER_STATE_FILE)
         torch.save(scheduler.state_dict(), ckpt_path / SCHEDULER_STATE_FILE)
         torch.save(scaler.state_dict(),    ckpt_path / SCALER_STATE_FILE)
@@ -1015,14 +1011,17 @@ def train(args: argparse.Namespace) -> None:
     epoch_pbar.close()
     log_file.close()
 
-    # Final summary
+    # ── Final summary ──────────────────────────────────────────────────────────
     logger.info("\n" + "=" * 60)
     logger.info("TRAINING COMPLETE")
     logger.info("=" * 60)
-    logger.info(f"  Completed epochs : {completed_epochs}")
-    logger.info(f"  Trained layers   : last {args.freeze_layers} of {len(model.model.layers)}")
-    logger.info(f"  Final batch sizes: {train_loader.current_batch_sizes}")
-    logger.info(f"  Total steps      : {global_step}")
+    logger.info(f"  Completed epochs  : {completed_epochs}")
+    logger.info(f"  Trained layers    : last {args.freeze_layers} of {len(model.model.layers)}")
+    logger.info(
+        f"  Final sub-bs      : "
+        + ", ".join(f"{t}={train_loader.current_batch_sizes[t]}" for t in TASK_ORDER)
+    )
+    logger.info(f"  Total steps       : {global_step}")
 
     if epoch_results:
         logger.info("\nFinal Metrics:")
@@ -1036,11 +1035,16 @@ def train(args: argparse.Namespace) -> None:
 
     with open(output_dir / "final_report.json", "w", encoding="utf-8") as f:
         json.dump({
-            "model": args.model_name, "hub_repo": hub_repo,
-            "epochs": args.epochs, "freeze_layers": args.freeze_layers,
-            "completed_epochs": completed_epochs, "global_step": global_step,
-            "batch_sizes": dict(train_loader.current_batch_sizes),
-            "lr": args.lr, "epoch_results": epoch_results,
+            "model":             args.model_name,
+            "hub_repo":          hub_repo,
+            "epochs":            args.epochs,
+            "freeze_layers":     args.freeze_layers,
+            "completed_epochs":  completed_epochs,
+            "global_step":       global_step,
+            "batch_size":        args.batch_size,
+            "sub_batch_sizes":   dict(train_loader.current_batch_sizes),
+            "lr":                args.lr,
+            "epoch_results":     epoch_results,
         }, f, indent=2, ensure_ascii=False)
 
     plot_metrics(epoch_results, output_dir)
@@ -1055,18 +1059,18 @@ if __name__ == "__main__":
     args = parse_args()
 
     logger.info("=" * 60)
-    logger.info("Llama-3-8B — Last-N Layers Finetuning")
+    logger.info("Llama-3-8B — Last-N Layers Finetuning (Mixed Batch)")
     logger.info("=" * 60)
     logger.info(f"  model          : {args.model_name}")
     logger.info(f"  data_root      : {args.data_root}")
     logger.info(f"  output_dir     : {args.output_dir}")
     logger.info(f"  hub_repo       : {args.hub_repo}")
     logger.info(f"  epochs         : {args.epochs}")
-    logger.info(f"  batch_size     : {args.batch_size}")
+    logger.info(f"  batch_size     : {args.batch_size}  "
+                f"(mixed: ~{args.batch_size//3}+{args.batch_size//3}+{args.batch_size - 2*(args.batch_size//3)} per task)")
     logger.info(f"  freeze_layers  : {args.freeze_layers}  "
                 f"(train last {args.freeze_layers}/32 layers + norm + lm_head)")
     logger.info(f"  grad_ckpt      : {args.gradient_checkpointing}")
-    logger.info(f"  task_order     : {' → '.join(TASK_ORDER)}")
     logger.info(f"  lr             : {args.lr}")
     logger.info(f"  bf16/fp16      : {args.bf16}/{args.fp16}")
     logger.info("=" * 60)

@@ -24,20 +24,27 @@ Validation — Generate Mode:
     - SQuAD: F1 + Exact Match
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SequentialTaskDataLoader — 1 dataloader duy nhất, chạy tuần tự từng task
+MixedTaskDataLoader — mỗi batch chứa samples từ CẢ 3 TASK cùng lúc
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Thay vì mix 3 task cùng lúc, dataloader này yield toàn bộ MMLU trước,
-rồi đến SQuAD, rồi đến SNLI trong mỗi epoch.
+Phân bổ batch_size cho 3 task:
+  base = batch_size // 3
+  remainder = batch_size % 3   (0, 1, hoặc 2)
+  Phần dư được cộng thêm 1 vào các task theo thứ tự TASK_ORDER.
 
-Adaptive batch size:
-  - Mỗi task bắt đầu với batch_size được truyền vào (mặc định 64)
-  - Nếu gặp OOM → tự động giảm một nửa và retry
-  - In thông báo khi đổi task và khi OOM / thay đổi batch size
-  - Batch size hiệu quả được lưu lại cho lần gọi tiếp theo
+  Ví dụ batch_size=16:  base=5, remainder=1  → MMLU=6, SQuAD=5, SNLI=5
+  Ví dụ batch_size=17:  base=5, remainder=2  → MMLU=6, SQuAD=6, SNLI=5
+  Ví dụ batch_size=15:  base=5, remainder=0  → MMLU=5, SQuAD=5, SNLI=5
 
-Cơ chế: DataLoader thực sự được tạo on-the-fly per task với batch size
-hiện tại. OOM được bắt bên ngoài (trong training loop) và caller
-gọi loader.report_oom() để trigger giảm batch size.
+Epoch kết thúc khi task có ÍT RECORDS NHẤT hết data (min strategy).
+Tổng số batches = n_records_of_shortest_task // sub_batch_size_of_that_task.
+
+Adaptive batch size (OOM):
+  - report_oom() giảm batch_size chung xuống một nửa
+  - Sub-batch sizes của tất cả task được tính lại ngay
+
+Backward compatibility:
+  - SequentialTaskDataLoader là alias của MixedTaskDataLoader
+  - current_batch_sizes vẫn là Dict[str, int] nhưng giờ phản ánh sub-batch mỗi task
 """
 
 import json
@@ -51,7 +58,6 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
-from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -64,7 +70,7 @@ SNLI_CANDIDATES  = ["entailment", "neutral", "contradiction"]
 
 MMLU_OPTIONS     = ["A", "B", "C", "D"]
 
-TASK_ORDER = ["mmlu", "squad", "snli"]   # thứ tự yield trong mỗi epoch
+TASK_ORDER = ["mmlu", "squad", "snli"]   # thứ tự ưu tiên khi phân bổ phần dư
 
 _SYSTEM_PROMPT = (
     "You are a precise answer extraction assistant. "
@@ -305,6 +311,7 @@ class _BaseValDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def _collate_fn_sft(batch: List[Dict], pad_token_id: int) -> Dict:
+    """Right-pad for training. Supports mixed-task batches."""
     max_len = max(s["input_ids"].size(0) for s in batch)
     input_ids_list, mask_list, labels_list = [], [], []
     for s in batch:
@@ -331,6 +338,7 @@ def _collate_fn_sft(batch: List[Dict], pad_token_id: int) -> Dict:
 
 
 def _collate_fn_val(batch: List[Dict], pad_token_id: int) -> Dict:
+    """Left-pad for generation."""
     max_len = max(s["input_ids"].size(0) for s in batch)
     input_ids_list, mask_list = [], []
     for s in batch:
@@ -405,9 +413,30 @@ def _get_tokenizer(tok: Optional[PreTrainedTokenizerBase]) -> PreTrainedTokenize
 
 
 def _count_batches(n_records: int, batch_size: int) -> int:
-    if n_records == 0:
+    if n_records == 0 or batch_size == 0:
         return 0
     return (n_records + batch_size - 1) // batch_size
+
+
+def _compute_sub_batch_sizes(total_batch_size: int) -> Dict[str, int]:
+    """
+    Chia total_batch_size đều cho 3 task.
+    Phần dư (0, 1, hoặc 2) được cộng thêm 1 theo thứ tự TASK_ORDER.
+
+    Ví dụ:
+      total=16 → base=5, rem=1 → mmlu=6, squad=5, snli=5
+      total=17 → base=5, rem=2 → mmlu=6, squad=6, snli=5
+      total=15 → base=5, rem=0 → mmlu=5, squad=5, snli=5
+      total=3  → base=1, rem=0 → mmlu=1, squad=1, snli=1
+      total=1  → base=0, rem=1 → mmlu=1, squad=0, snli=0  (edge case)
+    """
+    n_tasks = len(TASK_ORDER)
+    base    = total_batch_size // n_tasks
+    rem     = total_batch_size % n_tasks
+    sizes   = {}
+    for i, task in enumerate(TASK_ORDER):
+        sizes[task] = base + (1 if i < rem else 0)
+    return sizes
 
 
 # ---------------------------------------------------------------------------
@@ -545,38 +574,67 @@ def _load_snli(snli_dir: Path, splits: List[str]) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
-# SequentialTaskDataLoader — 1 dataloader duy nhất, từng task tuần tự
+# _ShuffledIndexIterator — lazy shuffled index stream per task
 # ---------------------------------------------------------------------------
 
-class SequentialTaskDataLoader:
+class _ShuffledIndexIterator:
     """
-    DataLoader duy nhất chạy tuần tự từng task: MMLU → SQuAD → SNLI.
+    Yields indices [0, n) in shuffled order, epoch-aware.
+    Stops after exactly n indices (one pass over dataset).
+    """
+    def __init__(self, n: int, seed: int, epoch: int) -> None:
+        self._n     = n
+        rng         = random.Random(seed + epoch)
+        self._idxs  = list(range(n))
+        rng.shuffle(self._idxs)
+        self._pos   = 0
 
-    Adaptive batch size:
-      - Mỗi task bắt đầu với initial_batch_size
-      - Caller gọi report_oom(task) khi gặp OOM → batch size giảm một nửa
-      - In thông báo đổi task và OOM / thay đổi batch size
+    def take(self, k: int) -> Optional[List[int]]:
+        """
+        Return next k indices, or None if fewer than k remain.
+        This ensures we never yield a partial sub-batch.
+        """
+        if self._pos + k > self._n:
+            return None
+        result    = self._idxs[self._pos : self._pos + k]
+        self._pos += k
+        return result
 
-    Cách dùng trong training loop:
-        loader = SequentialTaskDataLoader(...)
-        for batch in loader:
-            try:
-                loss = forward(batch)
-                loss.backward()
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                loader.report_oom(batch["task"][0])
-                optimizer.zero_grad()
-                continue   # bỏ batch này, batch tiếp theo sẽ dùng bs nhỏ hơn
+    @property
+    def remaining(self) -> int:
+        return self._n - self._pos
 
-    Thuộc tính public:
-        current_batch_sizes   Dict[str, int]   batch size hiện tại mỗi task
-        current_task          str              task đang được yield
-        total_batches         int              tổng số batch ước tính (thay đổi khi OOM)
+
+# ---------------------------------------------------------------------------
+# MixedTaskDataLoader — mỗi batch chứa samples từ CẢ 3 TASK cùng lúc
+# ---------------------------------------------------------------------------
+
+class MixedTaskDataLoader:
+    """
+    DataLoader yield mỗi batch chứa samples từ cả 3 task (MMLU + SQuAD + SNLI).
+
+    Phân bổ sub-batch sizes:
+      base = batch_size // 3
+      remainder = batch_size % 3
+      Task theo TASK_ORDER được cộng thêm 1 nếu i < remainder.
+
+      VD: bs=16 → mmlu=6, squad=5, snli=5
+          bs=17 → mmlu=6, squad=6, snli=5
+          bs=15 → mmlu=5, squad=5, snli=5
+
+    Epoch kết thúc khi task nào hết data trước (min strategy).
+
+    Adaptive OOM:
+      report_oom() → giảm global batch_size một nửa → tính lại sub-batch sizes.
+
+    Interface với Llama3-8B-Finetuning.py:
+      - current_batch_sizes: Dict[str, int]  — sub-batch size mỗi task
+      - report_oom(task)                     — giảm batch size, trả về batch_size mới
+      - set_epoch(epoch)
+      - __iter__, __len__
     """
 
-    # Batch size tối thiểu trước khi raise lỗi
-    MIN_BATCH_SIZE = 1
+    MIN_BATCH_SIZE = 3   # tối thiểu 1 sample/task → tổng tối thiểu 3
 
     def __init__(
         self,
@@ -585,7 +643,7 @@ class SequentialTaskDataLoader:
         squad_splits: List[str] = None,
         snli_splits: List[str] = None,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
-        initial_batch_size: int = 64,
+        initial_batch_size: int = 16,
         mmlu_max_length: int = 512,
         squad_max_length: int = 1024,
         snli_max_length: int = 256,
@@ -598,14 +656,15 @@ class SequentialTaskDataLoader:
         if squad_splits is None: squad_splits = ["train"]
         if snli_splits  is None: snli_splits  = ["train"]
 
-        self.tokenizer       = _get_tokenizer(tokenizer)
+        self.tokenizer   = _get_tokenizer(tokenizer)
         self.tokenizer.padding_side = "right"
-        self.initial_bs      = initial_batch_size
-        self.shuffle         = shuffle
-        self.seed            = seed
-        self.num_workers     = num_workers
-        self.pin_memory      = pin_memory
-        self._epoch          = 0
+        self._batch_size = max(self.MIN_BATCH_SIZE, initial_batch_size)
+        self.shuffle     = shuffle
+        self.seed        = seed
+        self.num_workers = num_workers
+        self.pin_memory  = pin_memory
+        self._epoch      = 0
+        self._oom_count  = 0
 
         # ── Load raw records ──────────────────────────────────────────────────
         mmlu_records  = _load_mmlu(Path(data_root) / "MMLU",  mmlu_splits)
@@ -618,90 +677,90 @@ class SequentialTaskDataLoader:
             "squad": SQuADDataset(squad_records, self.tokenizer, squad_max_length),
             "snli":  SNLIDataset( snli_records,  self.tokenizer, snli_max_length),
         }
+        self._n_records: Dict[str, int] = {k: len(v.records) for k, v in self._datasets.items()}
 
-        # Proxy lengths cho SortedLengthSampler
-        self._lengths: Dict[str, List[int]] = {
-            "mmlu":  [len(r["question"]) + sum(len(c) for c in r.get("choices", []))
-                      for r in mmlu_records],
-            "squad": [len(r["context"]) for r in squad_records],
-            "snli":  [len(r["premise"]) + len(r["hypothesis"]) for r in snli_records],
-        }
+        # ── Compute initial sub-batch sizes ───────────────────────────────────
+        self._sub_bs: Dict[str, int] = _compute_sub_batch_sizes(self._batch_size)
 
-        # ── Adaptive batch sizes — độc lập mỗi task ──────────────────────────
-        self.current_batch_sizes: Dict[str, int] = {
-            "mmlu":  initial_batch_size,
-            "squad": initial_batch_size,
-            "snli":  initial_batch_size,
-        }
-        self._oom_counts: Dict[str, int] = {"mmlu": 0, "squad": 0, "snli": 0}
+        # current_batch_sizes: public alias (mirrors _sub_bs) for compatibility
+        # with Llama3-8B-Finetuning.py which reads/writes this dict
+        self.current_batch_sizes: Dict[str, int] = self._sub_bs
 
-        # State
-        self.current_task: str = "mmlu"
+        self._print_summary()
 
-        n_records = {k: len(v.records) for k, v in self._datasets.items()}
-        print(
-            f"\n[SequentialTaskDataLoader]\n"
-            f"  Task order : {' → '.join(TASK_ORDER)}\n"
-            f"  MMLU  records={n_records['mmlu']:,}   bs={self.current_batch_sizes['mmlu']}\n"
-            f"  SQuAD records={n_records['squad']:,}   bs={self.current_batch_sizes['squad']}\n"
-            f"  SNLI  records={n_records['snli']:,}   bs={self.current_batch_sizes['snli']}\n"
-            f"  (batch sizes auto-reduce on OOM)"
-        )
+    # ── Public properties ─────────────────────────────────────────────────────
 
-    # ── Helpers ────────────────────────────────────────────────────────────────
-
-    def _make_loader(self, task: str) -> DataLoader:
-        """Tạo DataLoader cho task với batch size hiện tại."""
-        bs      = self.current_batch_sizes[task]
-        ds      = self._datasets[task]
-        lengths = self._lengths[task]
-        pad_id  = self.tokenizer.pad_token_id
-
-        sampler = SortedLengthSampler(lengths, bs, self.shuffle, self.seed)
-        sampler.set_epoch(self._epoch)
-
-        return DataLoader(
-            ds,
-            batch_size=bs,
-            sampler=sampler,
-            collate_fn=lambda b: _collate_fn_sft(b, pad_token_id=pad_id),
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            drop_last=False,
-        )
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
 
     @property
     def total_batches(self) -> int:
-        """Tổng số batch ước tính với batch sizes hiện tại."""
-        return sum(
-            _count_batches(len(self._datasets[t].records), self.current_batch_sizes[t])
+        """
+        Số batches mỗi epoch = min(n_records[task] // sub_bs[task] for task in TASK_ORDER).
+        Dùng floor division vì ta không yield partial sub-batch.
+        """
+        return min(
+            self._n_records[t] // self._sub_bs[t]
             for t in TASK_ORDER
+            if self._sub_bs[t] > 0
         )
+
+    # ── Setup helpers ─────────────────────────────────────────────────────────
+
+    def _print_summary(self) -> None:
+        n = self._n_records
+        s = self._sub_bs
+        print(
+            f"\n[MixedTaskDataLoader]\n"
+            f"  Global batch_size : {self._batch_size}  "
+            f"(mmlu={s['mmlu']} + squad={s['squad']} + snli={s['snli']})\n"
+            f"  MMLU  records={n['mmlu']:,}   sub_bs={s['mmlu']}\n"
+            f"  SQuAD records={n['squad']:,}   sub_bs={s['squad']}\n"
+            f"  SNLI  records={n['snli']:,}   sub_bs={s['snli']}\n"
+            f"  Batches/epoch ≈ {self.total_batches:,}  "
+            f"(limited by shortest task after sub-batch division)\n"
+            f"  Epoch ends when ANY task runs out of data (min strategy)"
+        )
+
+    def _rebuild_sub_bs(self) -> None:
+        """Recompute sub-batch sizes after a batch_size change and update public dict."""
+        new_sub = _compute_sub_batch_sizes(self._batch_size)
+        # update in-place so that external references to current_batch_sizes stay valid
+        self._sub_bs.update(new_sub)
+
+    # ── Interface ─────────────────────────────────────────────────────────────
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = epoch
 
     def report_oom(self, task: str) -> int:
         """
-        Caller gọi khi gặp OOM cho task này.
-        Giảm batch size một nửa. In thông báo.
-        Trả về batch size mới. Raise nếu đã đạt MIN_BATCH_SIZE.
+        Called by training loop on OOM.
+        Halves the global batch_size (minimum MIN_BATCH_SIZE).
+        Recomputes sub-batch sizes for all tasks.
+        Returns new global batch_size.
+        Raises RuntimeError if already at minimum.
         """
-        old_bs = self.current_batch_sizes[task]
+        old_bs = self._batch_size
         new_bs = max(self.MIN_BATCH_SIZE, old_bs // 2)
-        self._oom_counts[task] += 1
+        self._oom_count += 1
 
         if new_bs == old_bs:
             raise RuntimeError(
-                f"[OOM] Task '{task}': batch size đã đạt tối thiểu ({old_bs}), "
-                f"không thể giảm thêm! Cần giảm max_length hoặc dùng GPU lớn hơn."
+                f"[OOM #{self._oom_count}] batch_size đã đạt tối thiểu ({old_bs}), "
+                f"không thể giảm thêm! Hãy giảm max_length hoặc dùng GPU lớn hơn."
             )
 
-        self.current_batch_sizes[task] = new_bs
+        self._batch_size = new_bs
+        self._rebuild_sub_bs()
+
         print(
             f"\n{'!'*60}\n"
-            f"[OOM #{self._oom_counts[task]}] Task='{task}'  "
-            f"batch_size: {old_bs} → {new_bs}\n"
+            f"[OOM #{self._oom_count}] task='{task}'  "
+            f"global batch_size: {old_bs} → {new_bs}\n"
+            f"  New sub-batch sizes: "
+            f"mmlu={self._sub_bs['mmlu']} + squad={self._sub_bs['squad']} + snli={self._sub_bs['snli']}\n"
             f"{'!'*60}"
         )
         return new_bs
@@ -709,45 +768,69 @@ class SequentialTaskDataLoader:
     # ── Main iteration ─────────────────────────────────────────────────────────
 
     def __iter__(self) -> Iterator[Dict]:
-        for task in TASK_ORDER:
-            self.current_task = task
-            bs = self.current_batch_sizes[task]
-            n  = len(self._datasets[task].records)
+        """
+        Each iteration yields one mixed batch containing samples from all 3 tasks.
+        Stops when any task's index iterator cannot provide its sub-batch quota.
+        """
+        pad_id = self.tokenizer.pad_token_id
 
-            print(
-                f"\n{'─'*60}\n"
-                f"[DataLoader] ▶ Bắt đầu task: {task.upper():<6}  "
-                f"records={n:,}  batch_size={bs}  "
-                f"~{_count_batches(n, bs):,} batches\n"
-                f"{'─'*60}"
-            )
+        # Build per-task shuffled index iterators
+        iters: Dict[str, _ShuffledIndexIterator] = {
+            task: _ShuffledIndexIterator(self._n_records[task], self.seed, self._epoch)
+            for task in TASK_ORDER
+        }
 
-            # Yield batches cho task này
-            # Nếu OOM được báo cáo (qua report_oom), loader tiếp theo sẽ dùng bs nhỏ hơn
-            # Nhưng batch hiện tại vẫn cần được xử lý — caller tự bỏ qua và continue
-            loader = self._make_loader(task)
-            last_bs = bs
+        batch_idx = 0
+        while True:
+            # Snapshot current sub-batch sizes (may change mid-epoch after OOM)
+            sub_bs = {t: self._sub_bs[t] for t in TASK_ORDER}
 
-            for batch in loader:
-                # Kiểm tra xem batch size có bị thay đổi giữa chừng không (sau OOM)
-                cur_bs = self.current_batch_sizes[task]
-                if cur_bs != last_bs:
-                    # Batch size đã đổi, cần tạo lại loader
-                    # Nhưng ta không thể dừng iterator đang chạy dở —
-                    # thay vào đó, ta yield hết loader cũ rồi sau đó
-                    # iteration tiếp theo sẽ dùng loader mới.
-                    # → Để đơn giản và an toàn: yield batch hiện tại, đánh dấu cần rebuild
-                    last_bs = cur_bs
+            # Try to get sub-batch indices from each task
+            task_indices: Dict[str, List[int]] = {}
+            exhausted_task = None
+            for task in TASK_ORDER:
+                k = sub_bs[task]
+                if k == 0:
+                    task_indices[task] = []
+                    continue
+                idxs = iters[task].take(k)
+                if idxs is None:
+                    exhausted_task = task
+                    break
+                task_indices[task] = idxs
 
-                yield batch
+            if exhausted_task is not None:
+                # One task ran out — epoch ends
+                min_remaining = min(iters[t].remaining for t in TASK_ORDER)
+                print(
+                    f"\n[MixedTaskDataLoader] Epoch {self._epoch} ended after {batch_idx} batches. "
+                    f"Task '{exhausted_task}' exhausted first "
+                    f"(remaining across tasks: "
+                    + ", ".join(f"{t}={iters[t].remaining}" for t in TASK_ORDER)
+                    + ")"
+                )
+                break
 
-            print(
-                f"[DataLoader] ✓ Hoàn thành task: {task.upper():<6}  "
-                f"final batch_size={self.current_batch_sizes[task]}"
-            )
+            # Collect samples for all tasks
+            mixed_samples: List[Dict] = []
+            for task in TASK_ORDER:
+                dataset = self._datasets[task]
+                for idx in task_indices[task]:
+                    mixed_samples.append(dataset[idx])
+
+            # Shuffle within the mixed batch so task order isn't fixed
+            rng = random.Random(self.seed + self._epoch * 100000 + batch_idx)
+            rng.shuffle(mixed_samples)
+
+            yield _collate_fn_sft(mixed_samples, pad_token_id=pad_id)
+            batch_idx += 1
 
     def __len__(self) -> int:
         return self.total_batches
+
+
+# Backward compatibility alias — Llama3-8B-Finetuning.py imports this name
+SequentialTaskDataLoader = MixedTaskDataLoader
 
 
 # ---------------------------------------------------------------------------
