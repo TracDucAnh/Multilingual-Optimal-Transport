@@ -69,11 +69,10 @@ def load_model_and_tokenizer(dtype_str: str = "bf16"):
     tokenizer.padding_side = "left"   # ← thêm dòng này
     tokenizer.pad_token_id = 0
 
-    model.config.pad_token_id = 0
-
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME, torch_dtype=dtype, device_map="auto",
     )
+    model.config.pad_token_id = 0
     model.eval()
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[Model] Loaded. Parameters: {n_params / 1e9:.2f}B\n")
