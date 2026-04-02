@@ -644,7 +644,7 @@ def train(args: argparse.Namespace) -> None:
         try:
             api      = HfApi()
             whoami   = api.whoami()
-            username = whoami["name"]
+            username = "ducanhdinh"
             hub_repo = f"{username}/{hub_repo}"
             logger.info(f"[Hub] Full repo_id: {hub_repo}")
         except Exception as e:
