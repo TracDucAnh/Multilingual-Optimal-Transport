@@ -313,9 +313,10 @@ def _get_tokenizer(tok: Optional[PreTrainedTokenizerBase]) -> PreTrainedTokenize
     if tok is None:
         print(f"[Tokenizer] Loading {DEFAULT_MODEL}")
         tok = AutoTokenizer.from_pretrained(DEFAULT_MODEL, use_fast=True)
-    if tok.pad_token_id is None:
-        tok.pad_token_id = tok.eos_token_id
-    tok.padding_side = "left"   # ← thêm dòng này
+    tok.padding_side = "left"
+    # Dùng <unk> (id=0) làm pad thay vì eos_token_id
+    # → tách biệt pad_token_id khỏi eos, tránh HF nhầm truncation artifact là padding
+    tok.pad_token_id = 0
     return tok
 
 

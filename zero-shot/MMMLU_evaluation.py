@@ -67,6 +67,9 @@ def load_model_and_tokenizer(dtype_str: str = "bf16"):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "left"   # ← thêm dòng này
+    tokenizer.pad_token_id = 0
+
+    model.config.pad_token_id = 0
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME, torch_dtype=dtype, device_map="auto",
@@ -178,8 +181,8 @@ def evaluate(
                     max_new_tokens=max_new_tokens,
                     num_beams=num_beams,
                     do_sample=False,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=0,                        # ← explicit, tránh fallback về eos
+                    eos_token_id=tokenizer.eos_token_id,   # ← vẫn stop đúng tại eos
                 )
             # output_ids: [B, input_len + new_tokens]
 
