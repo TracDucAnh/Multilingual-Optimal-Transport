@@ -57,6 +57,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from dotenv import load_dotenv
 import matplotlib
 matplotlib.use("Agg")   # non-interactive backend
 import matplotlib.pyplot as plt
@@ -632,6 +633,7 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # ── HF Hub login ──────────────────────────────────────────────────────────
+    load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:
         login(token=hf_token)
