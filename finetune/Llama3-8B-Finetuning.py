@@ -21,6 +21,14 @@ L_LM = CrossEntropy(shift_logits, shift_labels, ignore_index=-100)
   shift_labels = labels[:, 1:]      (-100 trên prompt, answer+EOS có loss)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OOM Handling (Fixed)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  - Catch cả torch.cuda.OutOfMemoryError lẫn RuntimeError("CUDA error: out of memory")
+    (torch.AcceleratorError kế thừa RuntimeError, không phải OutOfMemoryError)
+  - Sau OOM: del tensors + gc.collect() để giải phóng GPU memory triệt để
+  - oom_skip_count cooldown: bỏ qua N batch sau OOM cho GPU kịp ổn định
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Resume
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   - Khi start: check HF Hub có repo chưa
@@ -42,6 +50,7 @@ Usage
 """
 
 import argparse
+import gc
 import json
 import logging
 import math
@@ -56,7 +65,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 from huggingface_hub import HfApi, hf_hub_download, login
@@ -116,6 +125,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay",    type=float, default=0.01)
     parser.add_argument("--max_grad_norm",   type=float, default=1.0)
     parser.add_argument("--seed",            type=int,   default=42)
+    parser.add_argument("--oom_skip_batches", type=int,  default=3,
+                        help="Số batch bỏ qua sau mỗi OOM để GPU kịp giải phóng memory")
 
     # Model
     parser.add_argument("--model_name",      type=str,   default=DEFAULT_MODEL)
@@ -162,6 +173,45 @@ def compute_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         shift_logits.view(-1, vocab_size),
         shift_labels.view(-1),
     )
+
+
+# ---------------------------------------------------------------------------
+# OOM detection helper
+# ---------------------------------------------------------------------------
+
+def _is_oom_error(e: Exception) -> bool:
+    """
+    Trả True nếu exception là OOM — bao gồm:
+      - torch.cuda.OutOfMemoryError  (PyTorch gốc)
+      - RuntimeError / torch.AcceleratorError có chứa "out of memory"
+        (xảy ra khi lỗi được raise từ CUDA kernel bất đồng bộ)
+    """
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return True
+    if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
+        return True
+    return False
+
+
+def _cleanup_after_oom(
+    optimizer: torch.optim.Optimizer,
+    *tensors_to_delete,
+) -> None:
+    """
+    Dọn dẹp GPU memory sau OOM:
+      1. del tất cả tensors được truyền vào
+      2. zero_grad(set_to_none=True) — giải phóng grad buffers
+      3. empty_cache() — trả memory về CUDA allocator
+      4. gc.collect() — Python garbage collection
+    """
+    for t in tensors_to_delete:
+        try:
+            del t
+        except Exception:
+            pass
+    optimizer.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+    gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +311,7 @@ def save_and_push_state(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_mmlu(model, tokenizer, val_loader, device, max_new_tokens, dtype) -> Dict:
+def evaluate_mmlu(model, tokenizer, val_loader, device, max_new_tokens, amp_dtype, use_amp) -> Dict:
     model.eval()
     n_correct, n_total, n_unknown = 0, 0, 0
     pbar = tqdm(val_loader, desc="  [Eval] MMLU", unit="batch", dynamic_ncols=True)
@@ -270,7 +320,7 @@ def evaluate_mmlu(model, tokenizer, val_loader, device, max_new_tokens, dtype) -
         attention_mask = batch["attention_mask"].to(device)
         gold_labels    = batch["gold_label"]
         prompt_len     = input_ids.size(1)
-        with autocast(dtype=dtype):
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
             gen_ids = model.generate(
                 input_ids, attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens, do_sample=False, temperature=1.0,
@@ -293,7 +343,7 @@ def evaluate_mmlu(model, tokenizer, val_loader, device, max_new_tokens, dtype) -
 
 
 @torch.no_grad()
-def evaluate_snli(model, tokenizer, val_loader, device, max_new_tokens, dtype) -> Dict:
+def evaluate_snli(model, tokenizer, val_loader, device, max_new_tokens, amp_dtype, use_amp) -> Dict:
     model.eval()
     n_correct, n_total, n_unknown = 0, 0, 0
     pbar = tqdm(val_loader, desc="  [Eval] SNLI", unit="batch", dynamic_ncols=True)
@@ -302,7 +352,7 @@ def evaluate_snli(model, tokenizer, val_loader, device, max_new_tokens, dtype) -
         attention_mask = batch["attention_mask"].to(device)
         gold_labels    = batch["gold_label"]
         prompt_len     = input_ids.size(1)
-        with autocast(dtype=dtype):
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
             gen_ids = model.generate(
                 input_ids, attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens, do_sample=False, temperature=1.0,
@@ -325,7 +375,7 @@ def evaluate_snli(model, tokenizer, val_loader, device, max_new_tokens, dtype) -
 
 
 @torch.no_grad()
-def evaluate_squad(model, tokenizer, val_loader, device, max_new_tokens, dtype) -> Dict:
+def evaluate_squad(model, tokenizer, val_loader, device, max_new_tokens, amp_dtype, use_amp) -> Dict:
     model.eval()
     total_f1, total_em, n_total = 0.0, 0.0, 0
     pbar = tqdm(val_loader, desc="  [Eval] SQuAD", unit="batch", dynamic_ncols=True)
@@ -334,7 +384,7 @@ def evaluate_squad(model, tokenizer, val_loader, device, max_new_tokens, dtype) 
         attention_mask = batch["attention_mask"].to(device)
         all_answers    = batch["answers"]
         prompt_len     = input_ids.size(1)
-        with autocast(dtype=dtype):
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
             gen_ids = model.generate(
                 input_ids, attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens, do_sample=False, temperature=1.0,
@@ -355,7 +405,7 @@ def evaluate_squad(model, tokenizer, val_loader, device, max_new_tokens, dtype) 
     return {"f1": f1, "em": em, "n_total": n_total}
 
 
-def run_evaluation(model, tokenizer, args, device, dtype, epoch, output_dir) -> Dict:
+def run_evaluation(model, tokenizer, args, device, amp_dtype, use_amp, epoch, output_dir) -> Dict:
     logger.info(f"[Eval] Bắt đầu evaluation sau epoch {epoch}...")
     tokenizer.padding_side = "left"
 
@@ -365,7 +415,7 @@ def run_evaluation(model, tokenizer, args, device, dtype, epoch, output_dir) -> 
         batch_size=args.eval_batch, max_length=args.mmlu_max_len,
         shuffle=False, num_workers=0,
     )
-    mmlu_res = evaluate_mmlu(model, tokenizer, mmlu_val, device, args.max_new_tokens, dtype)
+    mmlu_res = evaluate_mmlu(model, tokenizer, mmlu_val, device, args.max_new_tokens, amp_dtype, use_amp)
     logger.info(f"[Eval] MMLU  acc={mmlu_res['accuracy']:.4f}  "
                 f"({mmlu_res['n_correct']}/{mmlu_res['n_total']})  "
                 f"unknown_rate={mmlu_res['unknown_rate']:.3f}")
@@ -376,7 +426,7 @@ def run_evaluation(model, tokenizer, args, device, dtype, epoch, output_dir) -> 
         batch_size=args.eval_batch, max_length=args.snli_max_len,
         shuffle=False, num_workers=0,
     )
-    snli_res = evaluate_snli(model, tokenizer, snli_val, device, args.max_new_tokens, dtype)
+    snli_res = evaluate_snli(model, tokenizer, snli_val, device, args.max_new_tokens, amp_dtype, use_amp)
     logger.info(f"[Eval] SNLI  acc={snli_res['accuracy']:.4f}  "
                 f"({snli_res['n_correct']}/{snli_res['n_total']})  "
                 f"unknown_rate={snli_res['unknown_rate']:.3f}")
@@ -387,7 +437,7 @@ def run_evaluation(model, tokenizer, args, device, dtype, epoch, output_dir) -> 
         batch_size=args.eval_batch, max_length=args.squad_max_len,
         shuffle=False, num_workers=0,
     )
-    squad_res = evaluate_squad(model, tokenizer, squad_val, device, args.max_new_tokens, dtype)
+    squad_res = evaluate_squad(model, tokenizer, squad_val, device, args.max_new_tokens, amp_dtype, use_amp)
     logger.info(f"[Eval] SQuAD F1={squad_res['f1']:.4f}  EM={squad_res['em']:.4f}  "
                 f"n={squad_res['n_total']}")
 
@@ -609,7 +659,9 @@ def train(args: argparse.Namespace) -> None:
         num_warmup_steps=warmup_steps,
         num_training_steps=total_opt_steps,
     )
-    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+
+    # GradScaler chỉ dùng cho fp16 (bf16 không cần scaler)
+    scaler = GradScaler(device="cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
     logger.info(f"[Setup] steps_per_epoch≈{steps_per_epoch}  "
                 f"total_opt_steps≈{total_opt_steps}  warmup={warmup_steps}")
@@ -647,7 +699,7 @@ def train(args: argparse.Namespace) -> None:
 
         train_loader.set_epoch(epoch)
         model.train()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         # Progress bar cho epoch (theo batches)
         batch_pbar = tqdm(
@@ -658,9 +710,10 @@ def train(args: argparse.Namespace) -> None:
             leave=False,
         )
 
-        running_loss  = 0.0
-        running_count = 0
-        current_task  = None
+        running_loss   = 0.0
+        running_count  = 0
+        current_task   = None
+        oom_skip_count = 0   # số batch còn phải skip sau OOM gần nhất
 
         for batch in train_loader:
             task = batch["task"][0]
@@ -682,13 +735,23 @@ def train(args: argparse.Namespace) -> None:
                 batch_pbar.total = len(train_loader)
                 batch_pbar.refresh()
 
-            # ── Forward pass với OOM handling ─────────────────────────────────
+            # ── Cooldown sau OOM: skip N batch để GPU kịp "nguội" ─────────────
+            if oom_skip_count > 0:
+                oom_skip_count -= 1
+                batch_pbar.update(1)
+                batch_pbar.set_postfix(status=f"OOM cooldown ({oom_skip_count} left)")
+                continue
+
+            # ── Move batch lên device ─────────────────────────────────────────
             input_ids      = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels         = batch["labels"].to(device)
 
+            # ── Forward pass với OOM handling ─────────────────────────────────
+            outputs = None
+            loss    = None
             try:
-                with autocast(dtype=amp_dtype, enabled=use_amp):
+                with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
@@ -704,22 +767,28 @@ def train(args: argparse.Namespace) -> None:
                 running_loss  += loss.item()
                 running_count += 1
 
-            except torch.cuda.OutOfMemoryError:
-                # ── OOM: giảm batch size, bỏ batch này ───────────────────────
-                torch.cuda.empty_cache()
-                optimizer.zero_grad()
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if not _is_oom_error(e):
+                    # Không phải OOM → re-raise nguyên vẹn
+                    raise
+
+                # ── Dọn sạch GPU memory triệt để ──────────────────────────────
+                _cleanup_after_oom(optimizer, outputs, loss, input_ids, attention_mask, labels)
+
                 try:
                     new_bs = train_loader.report_oom(task)
+                    oom_skip_count = args.oom_skip_batches
                     logger.warning(
                         f"[OOM] Epoch {epoch} | task={task} | "
-                        f"Bỏ batch hiện tại, tiếp tục với bs={new_bs}"
+                        f"bs → {new_bs} | skip {oom_skip_count} batch kế tiếp"
                     )
-                    # Cập nhật tqdm total
+                    # Cập nhật tqdm total vì bs thay đổi → số batch thay đổi
                     batch_pbar.total = len(train_loader)
                     batch_pbar.refresh()
-                except RuntimeError as e:
-                    logger.error(str(e))
+                except RuntimeError as re:
+                    logger.error(f"[OOM] Không thể giảm batch size thêm: {re}")
                     raise
+
                 batch_pbar.update(1)
                 continue
 
@@ -738,7 +807,7 @@ def train(args: argparse.Namespace) -> None:
                 optimizer.step()
 
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
             avg_loss     = running_loss / running_count
@@ -786,7 +855,7 @@ def train(args: argparse.Namespace) -> None:
         eval_res = None
         if not args.skip_eval:
             eval_res = run_evaluation(
-                model, tokenizer, args, device, amp_dtype, epoch, output_dir
+                model, tokenizer, args, device, amp_dtype, use_amp, epoch, output_dir
             )
             epoch_results.append(eval_res)
             plot_metrics(epoch_results, output_dir)
@@ -877,6 +946,7 @@ if __name__ == "__main__":
     logger.info(f"  hub_repo:     {args.hub_repo}")
     logger.info(f"  epochs:       {args.epochs}")
     logger.info(f"  batch_size:   {args.batch_size} (auto-reduce on OOM)")
+    logger.info(f"  oom_skip:     {args.oom_skip_batches} batches after each OOM")
     logger.info(f"  task_order:   {' → '.join(TASK_ORDER)}")
     logger.info(f"  lr:           {args.lr}")
     logger.info(f"  bf16:         {args.bf16}  fp16: {args.fp16}")
