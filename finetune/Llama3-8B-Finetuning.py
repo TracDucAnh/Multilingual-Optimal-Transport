@@ -64,6 +64,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 from huggingface_hub import HfApi, login
 
@@ -95,8 +96,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +252,8 @@ def evaluate_mmlu(
     model.eval()
     n_correct, n_total, n_unknown = 0, 0, 0
 
-    for batch in val_loader:
+    pbar = tqdm(val_loader, desc="  [Eval] MMLU", unit="batch", dynamic_ncols=True)
+    for batch in pbar:
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         gold_labels    = batch["gold_label"]
@@ -281,6 +281,12 @@ def evaluate_mmlu(
                 n_correct += 1
             n_total += 1
 
+        # Cập nhật postfix tqdm với acc hiện tại
+        acc_so_far = n_correct / n_total if n_total > 0 else 0.0
+        pbar.set_postfix(acc=f"{acc_so_far:.4f}", correct=n_correct, total=n_total)
+
+    pbar.close()
+
     accuracy      = n_correct / n_total if n_total > 0 else 0.0
     unknown_rate  = n_unknown / n_total if n_total > 0 else 0.0
     return {
@@ -307,7 +313,8 @@ def evaluate_snli(
     model.eval()
     n_correct, n_total, n_unknown = 0, 0, 0
 
-    for batch in val_loader:
+    pbar = tqdm(val_loader, desc="  [Eval] SNLI", unit="batch", dynamic_ncols=True)
+    for batch in pbar:
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         gold_labels    = batch["gold_label"]
@@ -333,6 +340,12 @@ def evaluate_snli(
             if pred == gold:
                 n_correct += 1
             n_total += 1
+
+        # Cập nhật postfix tqdm với acc hiện tại
+        acc_so_far = n_correct / n_total if n_total > 0 else 0.0
+        pbar.set_postfix(acc=f"{acc_so_far:.4f}", correct=n_correct, total=n_total)
+
+    pbar.close()
 
     accuracy     = n_correct / n_total if n_total > 0 else 0.0
     unknown_rate = n_unknown / n_total if n_total > 0 else 0.0
@@ -360,7 +373,8 @@ def evaluate_squad(
     model.eval()
     total_f1, total_em, n_total = 0.0, 0.0, 0
 
-    for batch in val_loader:
+    pbar = tqdm(val_loader, desc="  [Eval] SQuAD", unit="batch", dynamic_ncols=True)
+    for batch in pbar:
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         all_answers    = batch["answers"]   # List[List[str]]
@@ -383,6 +397,13 @@ def evaluate_squad(
             total_em += compute_exact_match(pred, gold_list)
             total_f1 += compute_f1_score(pred, gold_list)
             n_total  += 1
+
+        # Cập nhật postfix tqdm với F1/EM hiện tại
+        f1_so_far = total_f1 / n_total if n_total > 0 else 0.0
+        em_so_far = total_em / n_total if n_total > 0 else 0.0
+        pbar.set_postfix(F1=f"{f1_so_far:.4f}", EM=f"{em_so_far:.4f}", n=n_total)
+
+    pbar.close()
 
     f1 = total_f1 / n_total if n_total > 0 else 0.0
     em = total_em / n_total if n_total > 0 else 0.0
@@ -744,6 +765,15 @@ def train(args: argparse.Namespace) -> None:
     running_loss    = 0.0
     t_start         = time.time()
 
+    # tqdm progress bar toàn bộ training (theo optimizer steps)
+    overall_pbar = tqdm(
+        total=total_opt_steps,
+        desc="Training",
+        unit="step",
+        dynamic_ncols=True,
+        colour="green",
+    )
+
     for epoch in range(1, args.epochs + 1):
         logger.info(f"\n{'='*60}")
         logger.info(f"EPOCH {epoch}/{args.epochs}")
@@ -753,7 +783,16 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         optimizer.zero_grad()
 
-        for batch in train_loader:
+        # tqdm progress bar cho từng epoch (theo micro-batches)
+        epoch_pbar = tqdm(
+            train_loader,
+            desc=f"  Epoch {epoch}/{args.epochs}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,       # xoá bar sau khi epoch xong
+        )
+
+        for batch in epoch_pbar:
             micro_step += 1
 
             # Move to device
@@ -831,16 +870,25 @@ def train(args: argparse.Namespace) -> None:
                 log_file.flush()
                 loss_log.append({"step": global_step, "loss": avg_loss, "lr": current_lr})
 
-                # Console log mỗi 50 optimizer steps
-                if global_step % 50 == 0 or global_step <= 5:
-                    logger.info(
-                        f"  Epoch {epoch} | Step {global_step}/{total_opt_steps} | "
-                        f"Loss {avg_loss:.4f} | LR {current_lr:.2e} | "
-                        f"GradNorm {float(grad_norm):.3f} | "
-                        f"Tasks {set(batch['task'])}"
-                    )
+                # Cập nhật overall progress bar
+                overall_pbar.update(1)
+                overall_pbar.set_postfix(
+                    epoch=f"{epoch}/{args.epochs}",
+                    loss=f"{avg_loss:.4f}",
+                    lr=f"{current_lr:.2e}",
+                    grad=f"{float(grad_norm):.3f}",
+                )
+
+                # Cập nhật epoch progress bar
+                epoch_pbar.set_postfix(
+                    loss=f"{avg_loss:.4f}",
+                    lr=f"{current_lr:.2e}",
+                    step=f"{global_step}",
+                )
 
                 running_loss = 0.0
+
+        epoch_pbar.close()
 
         # ── End of epoch ──────────────────────────────────────────────────────
         logger.info(f"\n[Epoch {epoch}] Training done.")
@@ -864,6 +912,8 @@ def train(args: argparse.Namespace) -> None:
             # Update plots
             plot_metrics(epoch_results, output_dir)
             plot_training_loss(loss_log, output_dir)
+
+    overall_pbar.close()
 
     # ── Final summary ─────────────────────────────────────────────────────────
     log_file.close()
