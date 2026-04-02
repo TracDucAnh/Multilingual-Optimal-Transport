@@ -88,12 +88,23 @@ from finetune_dataloader import (
 # Logger setup
 # ---------------------------------------------------------------------------
 
+# ── HF Hub login ──────────────────────────────────────────────────────────
+hf_token = os.getenv("HF_TOKEN")
+if hf_token:
+    login(token=hf_token)
+    logger.info("[Hub] Logged in with HF_TOKEN")
+else:
+    logger.warning("[Hub] HF_TOKEN không được set — push hub có thể thất bại")
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -628,14 +639,6 @@ def train(args: argparse.Namespace) -> None:
         f"[Setup] effective_batch={args.batch_size}  "
         f"micro_batch={args.micro_batch}  accum_steps={accum_steps}"
     )
-
-    # ── HF Hub login ──────────────────────────────────────────────────────────
-    hf_token = os.getenv("HF_TOKEN")
-    if hf_token:
-        login(token=hf_token)
-        logger.info("[Hub] Logged in with HF_TOKEN")
-    else:
-        logger.warning("[Hub] HF_TOKEN không được set — push hub có thể thất bại")
 
     # Xác định full repo_id
     hub_repo = args.hub_repo
