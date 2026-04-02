@@ -8,10 +8,17 @@ trên ba English benchmark datasets (MMLU, SQuAD, SNLI) với:
   - Chạy TUẦN TỰ từng task: MMLU → SQuAD → SNLI (không mix)
   - 1 SequentialTaskDataLoader duy nhất với adaptive batch size (OOM → giảm ½)
   - Resume tự động: check HF Hub → load training_state.json → skip epoch đã xong
-  - Mỗi epoch push HF Hub kèm training_state.json
+  - Mỗi epoch push HF Hub kèm training_state.json + optimizer checkpoint
   - Per-iteration logging ra file .jsonl
   - Đồ thị acc / F1 / EM theo epoch (matplotlib)
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Resume đầy đủ bao gồm:
+  - Model weights  (push_to_hub)
+  - Optimizer state dict  → optimizer_state.pt  (upload lên Hub)
+  - Scheduler state dict  → scheduler_state.pt  (upload lên Hub)
+  - GradScaler state dict → scaler_state.pt     (upload lên Hub)
+  - training_state.json   → global_step, loss_log, epoch_results, batch_sizes
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Last-N Layers Finetuning
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -26,9 +33,6 @@ Last-N Layers Finetuning
     N=8  → trainable ~2.0B → optimizer ~16GB → tổng ~48GB  ✓ bs=16
     N=16 → trainable ~4.0B → optimizer ~32GB → tổng ~64GB  ✓ bs=8
     N=32 → full finetune   → optimizer ~64GB → tổng ~96GB  ✗ OOM
-
-  embed_tokens luôn bị freeze (tiết kiệm ~1GB optimizer state, ít ảnh hưởng perf).
-  Gradient checkpointing bật mặc định → tiết kiệm thêm ~10GB activation memory.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage
@@ -84,7 +88,6 @@ from finetune_dataloader import (
     DEFAULT_MODEL,
 )
 
-# Giảm CUDA memory fragmentation — phải set trước mọi CUDA call
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ---------------------------------------------------------------------------
@@ -98,7 +101,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TRAINING_STATE_FILE = "training_state.json"
+TRAINING_STATE_FILE  = "training_state.json"
+OPTIMIZER_STATE_FILE = "optimizer_state.pt"
+SCHEDULER_STATE_FILE = "scheduler_state.pt"
+SCALER_STATE_FILE    = "scaler_state.pt"
+LOSS_LOG_FILE        = "loss_log.json"
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +120,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hub_repo",         type=str,   default="Llama3-8B-Finetune")
     parser.add_argument("--hub_private",      action="store_true")
 
-    # Training hyper-params
     parser.add_argument("--epochs",           type=int,   default=3)
     parser.add_argument("--batch_size",       type=int,   default=16)
     parser.add_argument("--lr",               type=float, default=2e-5)
@@ -123,39 +129,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed",             type=int,   default=42)
     parser.add_argument("--oom_skip_batches", type=int,   default=3)
 
-    # ── Last-N layers (thay đổi chính) ────────────────────────────────────────
     parser.add_argument(
         "--freeze_layers", type=int, default=8,
         help=(
             "Số transformer layers CUỐI được train (còn lại bị freeze).\n"
-            "  0  → full finetune (không freeze gì, dễ OOM)\n"
+            "  0  → full finetune\n"
             "  8  → train layers[24..31] + norm + lm_head  (recommended 80GB)\n"
             "  16 → train layers[16..31] + norm + lm_head\n"
-            "  32 → train tất cả layers + norm + lm_head (= full nhưng freeze embed)"
+            "  32 → train tất cả layers + norm + lm_head (freeze embed)"
         ),
     )
 
-    # Memory
     parser.add_argument(
         "--gradient_checkpointing", action="store_true", default=True,
-        help="Bật gradient checkpointing — tiết kiệm ~10GB activation memory, chậm hơn ~20%%",
     )
     parser.add_argument(
         "--no_gradient_checkpointing", dest="gradient_checkpointing", action="store_false",
     )
 
-    # Model
     parser.add_argument("--model_name",    type=str, default=DEFAULT_MODEL)
     parser.add_argument("--mmlu_max_len",  type=int, default=512)
     parser.add_argument("--squad_max_len", type=int, default=1024)
     parser.add_argument("--snli_max_len",  type=int, default=256)
 
-    # Evaluation
     parser.add_argument("--eval_batch",     type=int, default=8)
     parser.add_argument("--max_new_tokens", type=int, default=32)
     parser.add_argument("--skip_eval",      action="store_true")
 
-    # Misc
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--fp16", action="store_true")
@@ -177,63 +177,47 @@ def set_seed(seed: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Last-N layers freeze  ← THAY ĐỔI CHÍNH
+# Last-N layers freeze
 # ---------------------------------------------------------------------------
 
 def freeze_model_layers(model: AutoModelForCausalLM, n_train_layers: int) -> None:
     """
     Freeze toàn bộ model rồi unfreeze N transformer layers cuối + norm + lm_head.
-
-    Llama-3-8B structure:
-        model.model.embed_tokens          ← luôn freeze
-        model.model.layers[0..31]         ← freeze layers[0..31-N], train layers[31-N+1..31]
-        model.model.norm                  ← luôn train
-        model.lm_head                     ← luôn train
-
-    Args:
-        n_train_layers: số layers cuối được train.
-                        0 = không train gì (vô nghĩa).
-                        32 = train tất cả layers (nhưng embed vẫn frozen).
+    embed_tokens luôn bị freeze.
     """
-    # Bước 1: Freeze toàn bộ
     for param in model.parameters():
         param.requires_grad = False
 
     if n_train_layers <= 0:
-        logger.warning("[Freeze] n_train_layers=0 → toàn bộ model frozen, không có gì để train!")
+        logger.warning("[Freeze] n_train_layers=0 → toàn bộ model frozen!")
         return
 
-    transformer_layers = model.model.layers          # ModuleList
-    total_layers       = len(transformer_layers)     # 32 với Llama-3-8B
+    transformer_layers = model.model.layers
+    total_layers       = len(transformer_layers)
     n_train            = min(n_train_layers, total_layers)
-    first_train_idx    = total_layers - n_train      # ví dụ: 32-8 = 24
+    first_train_idx    = total_layers - n_train
 
     logger.info(f"[Freeze] Tổng transformer layers : {total_layers}")
     logger.info(f"[Freeze] Frozen  : embed_tokens + layers[0..{first_train_idx - 1}]")
     logger.info(f"[Freeze] Trainable: layers[{first_train_idx}..{total_layers - 1}] + norm + lm_head")
 
-    # Bước 2: Unfreeze N layers cuối
     for layer in transformer_layers[first_train_idx:]:
         for param in layer.parameters():
             param.requires_grad = True
 
-    # Bước 3: Unfreeze final norm + lm_head (luôn cần train để output đúng)
     for param in model.model.norm.parameters():
         param.requires_grad = True
     for param in model.lm_head.parameters():
         param.requires_grad = True
 
-    # Bước 4: Log thống kê + memory estimate
     total_p     = sum(p.numel() for p in model.parameters())
     trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_p    = total_p - trainable_p
-    opt_mem_gb  = trainable_p * 4 * 2 / 1e9   # AdamW: 2 fp32 buffers per param
+    opt_mem_gb  = trainable_p * 4 * 2 / 1e9
 
     logger.info(f"[Freeze] Total params    : {total_p / 1e9:.3f}B")
-    logger.info(f"[Freeze] Trainable params: {trainable_p / 1e9:.3f}B  "
-                f"({100 * trainable_p / total_p:.1f}%)")
-    logger.info(f"[Freeze] Frozen params   : {frozen_p / 1e9:.3f}B  "
-                f"({100 * frozen_p / total_p:.1f}%)")
+    logger.info(f"[Freeze] Trainable params: {trainable_p / 1e9:.3f}B  ({100 * trainable_p / total_p:.1f}%)")
+    logger.info(f"[Freeze] Frozen params   : {frozen_p / 1e9:.3f}B  ({100 * frozen_p / total_p:.1f}%)")
     logger.info(f"[Freeze] Est. optimizer memory (AdamW fp32): ~{opt_mem_gb:.1f} GB")
 
 
@@ -254,7 +238,6 @@ def compute_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def _is_oom_error(e: Exception) -> bool:
-    """Catch cả OutOfMemoryError lẫn RuntimeError('CUDA error: out of memory')."""
     if isinstance(e, torch.cuda.OutOfMemoryError):
         return True
     if isinstance(e, RuntimeError) and "out of memory" in str(e).lower():
@@ -263,7 +246,6 @@ def _is_oom_error(e: Exception) -> bool:
 
 
 def _cleanup_after_oom(optimizer: torch.optim.Optimizer, *tensors) -> None:
-    """Xoá tensors, zero grad, empty cache, gc.collect."""
     for t in tensors:
         try:
             del t
@@ -296,52 +278,189 @@ def _ensure_repo_exists(hub_repo: str, private: bool) -> None:
         api.create_repo(repo_id=hub_repo, repo_type="model", private=private, exist_ok=True)
 
 
-def load_training_state(hub_repo: str) -> Optional[Dict]:
+def _download_hub_file(hub_repo: str, filename: str) -> Optional[str]:
+    """Download một file từ Hub, trả về local path hoặc None nếu không tồn tại."""
     try:
         local_path = hf_hub_download(
-            repo_id=hub_repo, filename=TRAINING_STATE_FILE, repo_type="model",
+            repo_id=hub_repo, filename=filename, repo_type="model",
         )
-        with open(local_path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        logger.info(f"[Resume] Tìm thấy {TRAINING_STATE_FILE}. "
-                    f"Completed epochs: {state.get('completed_epochs', [])}")
-        return state
+        return local_path
     except (EntryNotFoundError, RepositoryNotFoundError):
-        logger.info("[Resume] Không tìm thấy state — bắt đầu từ đầu.")
         return None
     except Exception as e:
-        logger.warning(f"[Resume] Lỗi load state: {e} — bắt đầu từ đầu.")
+        logger.warning(f"[Hub] Lỗi download '{filename}': {e}")
         return None
 
 
-def save_and_push_state(
+def load_training_state(hub_repo: str) -> Optional[Dict]:
+    """Load training_state.json từ Hub để xác định resume point."""
+    local_path = _download_hub_file(hub_repo, TRAINING_STATE_FILE)
+    if local_path is None:
+        logger.info("[Resume] Không tìm thấy state — bắt đầu từ đầu.")
+        return None
+    try:
+        with open(local_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        logger.info(
+            f"[Resume] Tìm thấy {TRAINING_STATE_FILE}. "
+            f"Completed epochs: {state.get('completed_epochs', [])}  "
+            f"global_step: {state.get('global_step', 0)}"
+        )
+        return state
+    except Exception as e:
+        logger.warning(f"[Resume] Lỗi parse state: {e} — bắt đầu từ đầu.")
+        return None
+
+
+def load_optimizer_states(
+    hub_repo: str,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: GradScaler,
+    device: torch.device,
+) -> None:
+    """
+    Download và load optimizer / scheduler / scaler state dicts từ Hub.
+    Nếu file không tồn tại thì bỏ qua (fresh start cho optimizer đó).
+    """
+    # --- Optimizer ---
+    opt_path = _download_hub_file(hub_repo, OPTIMIZER_STATE_FILE)
+    if opt_path:
+        try:
+            opt_state = torch.load(opt_path, map_location=device)
+            optimizer.load_state_dict(opt_state)
+            logger.info("[Resume] ✓ Optimizer state loaded.")
+        except Exception as e:
+            logger.warning(f"[Resume] Không load được optimizer state: {e}")
+    else:
+        logger.warning("[Resume] Không tìm thấy optimizer_state.pt — optimizer fresh start.")
+
+    # --- Scheduler ---
+    sch_path = _download_hub_file(hub_repo, SCHEDULER_STATE_FILE)
+    if sch_path:
+        try:
+            sch_state = torch.load(sch_path, map_location="cpu")
+            scheduler.load_state_dict(sch_state)
+            logger.info(
+                f"[Resume] ✓ Scheduler state loaded. "
+                f"last_epoch={scheduler.last_epoch}  "
+                f"lr={scheduler.get_last_lr()}"
+            )
+        except Exception as e:
+            logger.warning(f"[Resume] Không load được scheduler state: {e}")
+    else:
+        logger.warning("[Resume] Không tìm thấy scheduler_state.pt — scheduler fresh start.")
+
+    # --- GradScaler (chỉ cần thiết khi dùng fp16) ---
+    scl_path = _download_hub_file(hub_repo, SCALER_STATE_FILE)
+    if scl_path:
+        try:
+            scl_state = torch.load(scl_path, map_location="cpu")
+            scaler.load_state_dict(scl_state)
+            logger.info(f"[Resume] ✓ GradScaler state loaded. scale={scaler.get_scale():.1f}")
+        except Exception as e:
+            logger.warning(f"[Resume] Không load được scaler state: {e}")
+
+    # --- Loss log ---
+    ll_path = _download_hub_file(hub_repo, LOSS_LOG_FILE)
+    if ll_path:
+        try:
+            with open(ll_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"[Resume] Không load được loss_log: {e}")
+    return []
+
+
+def _upload_file_to_hub(
+    hub_repo: str,
+    local_path: Path,
+    repo_filename: str,
+    commit_msg: str,
+) -> None:
+    """Upload một file lên Hub — bọc exception để không crash training."""
+    try:
+        HfApi().upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=repo_filename,
+            repo_id=hub_repo,
+            repo_type="model",
+            commit_message=commit_msg,
+        )
+    except Exception as e:
+        logger.error(f"[Hub] Upload '{repo_filename}' thất bại: {e}")
+
+
+def save_and_push_checkpoint(
     hub_repo: str,
     output_dir: Path,
     state: Dict,
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: GradScaler,
+    loss_log: List[Dict],
     epoch: int,
     private: bool,
 ) -> None:
+    """
+    Lưu tất cả state dict cần thiết để resume hoàn toàn, rồi push lên Hub.
+
+    Files được push:
+      - model weights + tokenizer  (push_to_hub)
+      - training_state.json        (metadata + epoch_results + global_step)
+      - optimizer_state.pt         (AdamW momentum buffers)
+      - scheduler_state.pt         (cosine schedule state)
+      - scaler_state.pt            (AMP loss scale)
+      - loss_log.json              (per-step loss history)
+    """
+    commit_base = f"epoch-{epoch}"
+    _ensure_repo_exists(hub_repo, private)
+
+    # 1. training_state.json
     state_path = output_dir / TRAINING_STATE_FILE
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
     logger.info(f"[State] Saved → {state_path}")
 
-    commit_msg = f"Epoch {epoch} — completed={state['completed_epochs']}"
+    # 2. optimizer_state.pt  — save lên CPU để tiết kiệm bộ nhớ khi load
+    opt_path = output_dir / OPTIMIZER_STATE_FILE
+    torch.save(optimizer.state_dict(), opt_path)
+    logger.info(f"[State] Optimizer state → {opt_path}  ({opt_path.stat().st_size / 1e6:.1f} MB)")
+
+    # 3. scheduler_state.pt
+    sch_path = output_dir / SCHEDULER_STATE_FILE
+    torch.save(scheduler.state_dict(), sch_path)
+
+    # 4. scaler_state.pt
+    scl_path = output_dir / SCALER_STATE_FILE
+    torch.save(scaler.state_dict(), scl_path)
+
+    # 5. loss_log.json
+    ll_path = output_dir / LOSS_LOG_FILE
+    with open(ll_path, "w", encoding="utf-8") as f:
+        json.dump(loss_log, f)
+
+    # 6. Push model + tokenizer
     try:
-        _ensure_repo_exists(hub_repo, private)
-        model.push_to_hub(hub_repo, commit_message=commit_msg, private=private)
-        tokenizer.push_to_hub(hub_repo, commit_message=commit_msg, private=private)
-        HfApi().upload_file(
-            path_or_fileobj=str(state_path),
-            path_in_repo=TRAINING_STATE_FILE,
-            repo_id=hub_repo, repo_type="model",
-            commit_message=f"Update state — epoch {epoch}",
-        )
-        logger.info(f"[Hub] ✓ Push thành công epoch {epoch}")
+        model.push_to_hub(hub_repo, commit_message=f"model {commit_base}", private=private)
+        tokenizer.push_to_hub(hub_repo, commit_message=f"tokenizer {commit_base}", private=private)
+        logger.info(f"[Hub] ✓ Model/tokenizer pushed — epoch {epoch}")
     except Exception as e:
-        logger.error(f"[Hub] Push thất bại: {e}")
+        logger.error(f"[Hub] Model push thất bại: {e}")
+
+    # 7. Upload aux files
+    for local_f, repo_f in [
+        (state_path, TRAINING_STATE_FILE),
+        (opt_path,   OPTIMIZER_STATE_FILE),
+        (sch_path,   SCHEDULER_STATE_FILE),
+        (scl_path,   SCALER_STATE_FILE),
+        (ll_path,    LOSS_LOG_FILE),
+    ]:
+        _upload_file_to_hub(hub_repo, local_f, repo_f, f"state {commit_base}")
+
+    logger.info(f"[Hub] ✓ Tất cả state files pushed — epoch {epoch}")
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +635,7 @@ def plot_metrics(epoch_results: List[Dict], output_dir: Path) -> None:
     plt.tight_layout()
     plt.savefig(output_dir / "metrics_plot.png", dpi=150, bbox_inches="tight")
     plt.close()
-    logger.info(f"[Plot] metrics_plot.png saved")
+    logger.info("[Plot] metrics_plot.png saved")
 
 
 def plot_training_loss(loss_log: List[Dict], output_dir: Path) -> None:
@@ -576,13 +695,21 @@ def train(args: argparse.Namespace) -> None:
 
     hub_repo = _resolve_hub_repo(args.hub_repo)
 
-    # ── Resume ────────────────────────────────────────────────────────────────
+    # ── Resume: load training_state trước để biết có resume không ─────────────
     training_state = load_training_state(hub_repo)
-    if training_state is not None:
+    is_resuming    = training_state is not None
+
+    if is_resuming:
         completed_epochs  = training_state.get("completed_epochs", [])
         epoch_results     = training_state.get("epoch_results", [])
         saved_batch_sizes = training_state.get("batch_sizes", {})
-        logger.info(f"[Resume] Completed: {completed_epochs} | BS: {saved_batch_sizes}")
+        # FIX: khôi phục global_step để loss_log liên tục
+        saved_global_step = training_state.get("global_step", 0)
+        logger.info(
+            f"[Resume] Completed: {completed_epochs} | "
+            f"global_step: {saved_global_step} | "
+            f"BS: {saved_batch_sizes}"
+        )
         tokenizer = AutoTokenizer.from_pretrained(hub_repo, use_fast=True)
         model     = AutoModelForCausalLM.from_pretrained(
             hub_repo, torch_dtype=dtype,
@@ -593,6 +720,7 @@ def train(args: argparse.Namespace) -> None:
         completed_epochs  = []
         epoch_results     = []
         saved_batch_sizes = {}
+        saved_global_step = 0
         logger.info(f"[Setup] Loading {args.model_name}")
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
         model     = AutoModelForCausalLM.from_pretrained(
@@ -608,8 +736,7 @@ def train(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         model = model.to(device)
 
-    # ── Freeze layers ─────────────────────────────────────────────────────────
-    # Phải gọi TRƯỚC gradient_checkpointing_enable()
+    # ── Freeze layers (TRƯỚC gradient_checkpointing_enable) ───────────────────
     if args.freeze_layers > 0:
         freeze_model_layers(model, n_train_layers=args.freeze_layers)
     else:
@@ -619,8 +746,6 @@ def train(args: argparse.Namespace) -> None:
 
     # ── Gradient checkpointing ────────────────────────────────────────────────
     if args.gradient_checkpointing:
-        # enable_input_require_grads() bắt buộc khi có frozen layers:
-        # gradient cần flow từ frozen input → vào trainable layers đầu tiên
         model.enable_input_require_grads()
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -652,7 +777,7 @@ def train(args: argparse.Namespace) -> None:
                 if bs != old:
                     logger.info(f"[Resume] batch_size[{task}]: {old} → {bs}")
 
-    # ── Optimizer — chỉ pass trainable params ─────────────────────────────────
+    # ── Optimizer ─────────────────────────────────────────────────────────────
     no_decay = {"bias", "LayerNorm.weight", "layer_norm.weight"}
     param_groups = [
         {
@@ -683,14 +808,34 @@ def train(args: argparse.Namespace) -> None:
 
     logger.info(f"[Setup] steps/epoch≈{steps_per_epoch}  total≈{total_opt_steps}  warmup={warmup_steps}")
 
+    # ── Resume optimizer/scheduler/scaler states ──────────────────────────────
+    # FIX: phải load SAU khi khởi tạo optimizer + scheduler + scaler
+    if is_resuming:
+        loss_log = load_optimizer_states(hub_repo, optimizer, scheduler, scaler, device)
+        if not isinstance(loss_log, list):
+            loss_log = []
+        logger.info(
+            f"[Resume] Optimizer LR after load: "
+            f"{[pg['lr'] for pg in optimizer.param_groups]}"
+        )
+        logger.info(
+            f"[Resume] Scheduler last_epoch={scheduler.last_epoch}  "
+            f"lr={scheduler.get_last_lr() if scheduler.last_epoch > 0 else 'not started'}"
+        )
+    else:
+        loss_log = []
+
+    # FIX: khôi phục global_step từ saved state
+    global_step = saved_global_step
+
     # ── Logging setup ─────────────────────────────────────────────────────────
-    log_file = open(output_dir / "train_log.jsonl",
-                    "a" if completed_epochs else "w", encoding="utf-8")
-    loss_log: List[Dict] = []
+    log_file = open(
+        output_dir / "train_log.jsonl",
+        "a" if is_resuming else "w",
+        encoding="utf-8",
+    )
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    global_step = 0
-
     epoch_pbar = tqdm(range(1, args.epochs + 1), desc="Epochs",
                       unit="epoch", dynamic_ncols=True, colour="green")
 
@@ -720,7 +865,6 @@ def train(args: argparse.Namespace) -> None:
         for batch in train_loader:
             task = batch["task"][0]
 
-            # Task switch log
             if task != current_task:
                 if current_task is not None:
                     logger.info(f"\n[Train] ✓ '{current_task.upper()}' done epoch {epoch}.")
@@ -731,7 +875,6 @@ def train(args: argparse.Namespace) -> None:
                 batch_pbar.total = len(train_loader)
                 batch_pbar.refresh()
 
-            # OOM cooldown
             if oom_skip_count > 0:
                 oom_skip_count -= 1
                 batch_pbar.update(1)
@@ -829,7 +972,7 @@ def train(args: argparse.Namespace) -> None:
             plot_metrics(epoch_results, output_dir)
             plot_training_loss(loss_log, output_dir)
 
-        # Save state & push
+        # Save & push  — FIX: truyền đủ optimizer/scheduler/scaler + global_step
         completed_epochs.append(epoch)
         state = {
             "model_name":       args.model_name,
@@ -841,15 +984,33 @@ def train(args: argparse.Namespace) -> None:
             "lr":               args.lr,
             "seed":             args.seed,
             "epoch_results":    epoch_results,
+            # FIX: lưu global_step để resume chính xác
+            "global_step":      global_step,
             "timestamp":        time.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         ckpt_path = output_dir / f"checkpoint_epoch{epoch}"
         model.save_pretrained(str(ckpt_path))
         tokenizer.save_pretrained(str(ckpt_path))
+        # FIX: cũng lưu optimizer state vào checkpoint local để có thể load offline
+        torch.save(optimizer.state_dict(), ckpt_path / OPTIMIZER_STATE_FILE)
+        torch.save(scheduler.state_dict(), ckpt_path / SCHEDULER_STATE_FILE)
+        torch.save(scaler.state_dict(),    ckpt_path / SCALER_STATE_FILE)
         logger.info(f"[Checkpoint] → {ckpt_path}")
 
-        save_and_push_state(hub_repo, output_dir, state, model, tokenizer, epoch, args.hub_private)
+        save_and_push_checkpoint(
+            hub_repo=hub_repo,
+            output_dir=output_dir,
+            state=state,
+            model=model,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            loss_log=loss_log,
+            epoch=epoch,
+            private=args.hub_private,
+        )
 
     epoch_pbar.close()
     log_file.close()
@@ -861,6 +1022,7 @@ def train(args: argparse.Namespace) -> None:
     logger.info(f"  Completed epochs : {completed_epochs}")
     logger.info(f"  Trained layers   : last {args.freeze_layers} of {len(model.model.layers)}")
     logger.info(f"  Final batch sizes: {train_loader.current_batch_sizes}")
+    logger.info(f"  Total steps      : {global_step}")
 
     if epoch_results:
         logger.info("\nFinal Metrics:")
@@ -876,7 +1038,7 @@ def train(args: argparse.Namespace) -> None:
         json.dump({
             "model": args.model_name, "hub_repo": hub_repo,
             "epochs": args.epochs, "freeze_layers": args.freeze_layers,
-            "completed_epochs": completed_epochs,
+            "completed_epochs": completed_epochs, "global_step": global_step,
             "batch_sizes": dict(train_loader.current_batch_sizes),
             "lr": args.lr, "epoch_results": epoch_results,
         }, f, indent=2, ensure_ascii=False)
