@@ -8,6 +8,7 @@ trên ba English benchmark datasets (MMLU, SQuAD, SNLI) với:
   - Mixed batch: mỗi batch chứa samples từ CẢ 3 task cùng lúc
   - MixedTaskDataLoader với adaptive batch size (OOM → giảm ½ toàn bộ)
   - Resume tự động: check HF Hub → load training_state.json → skip epoch đã xong
+  - --save_iter N: cứ N iteration push checkpoint lên Hub 1 lần (mid-epoch resume)
   - Mỗi epoch push HF Hub kèm training_state.json + optimizer checkpoint
   - Per-iteration logging ra file .jsonl
   - Đồ thị acc / F1 / EM theo epoch (matplotlib)
@@ -19,6 +20,12 @@ Resume đầy đủ bao gồm:
   - Scheduler state dict  → scheduler_state.pt  (upload lên Hub)
   - GradScaler state dict → scaler_state.pt     (upload lên Hub)
   - training_state.json   → global_step, loss_log, epoch_results, batch_size
+                            current_epoch, steps_done_in_epoch  ← mid-epoch resume
+
+  Khi resume mid-epoch:
+    - Load model/optimizer/scheduler/scaler từ Hub
+    - Skip (steps_done_in_epoch) batches đầu của epoch đó
+    - Tiếp tục training từ iteration kế tiếp
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Last-N Layers Finetuning
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -37,7 +44,7 @@ Last-N Layers Finetuning
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Usage
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # Recommended cho 80GB — train 8 layers cuối
+    # Recommended cho 80GB — train 8 layers cuối, save mỗi 500 iter
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
     python Llama3-8B-Finetuning.py \\
         --data_root   ../raw_data/english/ \\
@@ -46,7 +53,8 @@ Usage
         --epochs      3 \\
         --batch_size  16 \\
         --lr          2e-5 \\
-        --freeze_layers 8
+        --freeze_layers 8 \\
+        --save_iter   500
 """
 
 import argparse
@@ -129,6 +137,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_grad_norm",    type=float, default=1.0)
     parser.add_argument("--seed",             type=int,   default=42)
     parser.add_argument("--oom_skip_batches", type=int,   default=3)
+
+    # ── NEW: mid-epoch checkpoint ──────────────────────────────────────────
+    parser.add_argument(
+        "--save_iter", type=int, default=0,
+        help=(
+            "Nếu > 0: cứ mỗi save_iter iteration (global_step) sẽ push checkpoint "
+            "lên HuggingFace Hub, lưu đủ state để resume lại từ giữa epoch. "
+            "Ví dụ: --save_iter 500"
+        ),
+    )
+    # ──────────────────────────────────────────────────────────────────────
 
     parser.add_argument(
         "--freeze_layers", type=int, default=8,
@@ -294,7 +313,15 @@ def _download_hub_file(hub_repo: str, filename: str) -> Optional[str]:
 
 
 def load_training_state(hub_repo: str) -> Optional[Dict]:
-    """Load training_state.json từ Hub để xác định resume point."""
+    """
+    Load training_state.json từ Hub để xác định resume point.
+
+    State có thể chứa:
+      - completed_epochs      : list[int]  — các epoch đã hoàn thành
+      - current_epoch         : int        — epoch đang chạy dở (nếu có mid-epoch save)
+      - steps_done_in_epoch   : int        — số iteration đã hoàn thành trong current_epoch
+      - global_step           : int
+    """
     local_path = _download_hub_file(hub_repo, TRAINING_STATE_FILE)
     if local_path is None:
         logger.info("[Resume] Không tìm thấy state — bắt đầu từ đầu.")
@@ -305,6 +332,8 @@ def load_training_state(hub_repo: str) -> Optional[Dict]:
         logger.info(
             f"[Resume] Tìm thấy {TRAINING_STATE_FILE}. "
             f"Completed epochs: {state.get('completed_epochs', [])}  "
+            f"current_epoch: {state.get('current_epoch', None)}  "
+            f"steps_done_in_epoch: {state.get('steps_done_in_epoch', 0)}  "
             f"global_step: {state.get('global_step', 0)}"
         )
         return state
@@ -403,8 +432,14 @@ def save_and_push_checkpoint(
     loss_log: List[Dict],
     epoch: int,
     private: bool,
+    commit_suffix: str = "",
 ) -> None:
-    commit_base = f"epoch-{epoch}"
+    """
+    Push model + tất cả state files lên Hub.
+
+    commit_suffix: chuỗi phụ thêm vào commit message, vd "step-1500" hoặc "" (end-of-epoch).
+    """
+    commit_base = f"epoch-{epoch}" + (f"-{commit_suffix}" if commit_suffix else "")
     _ensure_repo_exists(hub_repo, private)
 
     # 1. training_state.json
@@ -435,7 +470,7 @@ def save_and_push_checkpoint(
     try:
         model.push_to_hub(hub_repo, commit_message=f"model {commit_base}", private=private)
         tokenizer.push_to_hub(hub_repo, commit_message=f"tokenizer {commit_base}", private=private)
-        logger.info(f"[Hub] ✓ Model/tokenizer pushed — epoch {epoch}")
+        logger.info(f"[Hub] ✓ Model/tokenizer pushed — {commit_base}")
     except Exception as e:
         logger.error(f"[Hub] Model push thất bại: {e}")
 
@@ -449,7 +484,7 @@ def save_and_push_checkpoint(
     ]:
         _upload_file_to_hub(hub_repo, local_f, repo_f, f"state {commit_base}")
 
-    logger.info(f"[Hub] ✓ Tất cả state files pushed — epoch {epoch}")
+    logger.info(f"[Hub] ✓ Tất cả state files pushed — {commit_base}")
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +688,49 @@ def plot_training_loss(loss_log: List[Dict], output_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mid-epoch state builder (dùng chung cho save_iter và end-of-epoch)
+# ---------------------------------------------------------------------------
+
+def _build_training_state(
+    args,
+    hub_repo: str,
+    completed_epochs: List[int],
+    epoch_results: List[Dict],
+    global_step: int,
+    train_loader,
+    current_epoch: int,
+    steps_done_in_epoch: int,
+    is_epoch_complete: bool,
+) -> Dict:
+    """
+    Tạo dict state để dump ra training_state.json.
+
+    - is_epoch_complete=True  → current_epoch / steps_done_in_epoch không cần resume
+    - is_epoch_complete=False → mid-epoch snapshot; resume sẽ skip steps_done_in_epoch batches
+    """
+    state = {
+        "model_name":           args.model_name,
+        "hub_repo":             hub_repo,
+        "total_epochs":         args.epochs,
+        "completed_epochs":     completed_epochs,
+        "freeze_layers":        args.freeze_layers,
+        "batch_size":           args.batch_size,
+        "sub_batch_sizes":      dict(train_loader.current_batch_sizes),
+        "lr":                   args.lr,
+        "seed":                 args.seed,
+        "epoch_results":        epoch_results,
+        "global_step":          global_step,
+        # ── mid-epoch resume fields ──────────────────────────────────────
+        "current_epoch":        current_epoch,
+        "steps_done_in_epoch":  steps_done_in_epoch,
+        "is_epoch_complete":    is_epoch_complete,
+        # ────────────────────────────────────────────────────────────────
+        "timestamp":            time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return state
+
+
+# ---------------------------------------------------------------------------
 # Main training
 # ---------------------------------------------------------------------------
 
@@ -688,29 +766,48 @@ def train(args: argparse.Namespace) -> None:
     training_state = load_training_state(hub_repo)
     is_resuming    = training_state is not None
 
+    # ── Các biến resume ────────────────────────────────────────────────────────
     if is_resuming:
-        completed_epochs  = training_state.get("completed_epochs", [])
-        epoch_results     = training_state.get("epoch_results", [])
-        # batch_size được lưu là global batch_size (không phải sub-batch per task)
-        saved_batch_size  = training_state.get("batch_size", args.batch_size)
-        saved_global_step = training_state.get("global_step", 0)
+        completed_epochs    = training_state.get("completed_epochs", [])
+        epoch_results       = training_state.get("epoch_results", [])
+        saved_batch_size    = training_state.get("batch_size", args.batch_size)
+        saved_global_step   = training_state.get("global_step", 0)
+
+        # Mid-epoch resume fields
+        resume_epoch        = training_state.get("current_epoch", None)
+        resume_skip_steps   = training_state.get("steps_done_in_epoch", 0)
+        is_epoch_complete   = training_state.get("is_epoch_complete", True)
+
+        # Nếu epoch đó đã complete rồi thì không cần mid-epoch resume
+        if is_epoch_complete or resume_epoch is None:
+            resume_epoch      = None
+            resume_skip_steps = 0
+
         logger.info(
             f"[Resume] Completed: {completed_epochs} | "
             f"global_step: {saved_global_step} | "
             f"global_batch_size: {saved_batch_size}"
         )
+        if resume_epoch is not None:
+            logger.info(
+                f"[Resume] Mid-epoch resume: epoch={resume_epoch}  "
+                f"skip first {resume_skip_steps} batches"
+            )
+
         tokenizer = AutoTokenizer.from_pretrained(hub_repo, use_fast=True)
         model     = AutoModelForCausalLM.from_pretrained(
             hub_repo, torch_dtype=dtype,
             device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True,
         )
-        # Restore batch_size từ checkpoint
         args.batch_size = saved_batch_size
     else:
-        completed_epochs  = []
-        epoch_results     = []
-        saved_global_step = 0
+        completed_epochs    = []
+        epoch_results       = []
+        saved_global_step   = 0
+        resume_epoch        = None
+        resume_skip_steps   = 0
+
         logger.info(f"[Setup] Loading {args.model_name}")
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
         model     = AutoModelForCausalLM.from_pretrained(
@@ -793,6 +890,8 @@ def train(args: argparse.Namespace) -> None:
         f"        sub-batch sizes: "
         + ", ".join(f"{t}={train_loader.current_batch_sizes[t]}" for t in TASK_ORDER)
     )
+    if args.save_iter > 0:
+        logger.info(f"[Setup] save_iter={args.save_iter}  → mid-epoch push mỗi {args.save_iter} steps")
 
     # ── Resume optimizer/scheduler/scaler states ──────────────────────────────
     if is_resuming:
@@ -820,10 +919,20 @@ def train(args: argparse.Namespace) -> None:
                       unit="epoch", dynamic_ncols=True, colour="green")
 
     for epoch in epoch_pbar:
+        # ── Skip completed epochs ─────────────────────────────────────────────
         if epoch in completed_epochs:
             logger.info(f"[Resume] Epoch {epoch} done — skip.")
             epoch_pbar.set_postfix(status="skipped")
             continue
+
+        # ── Determine how many batches to skip for mid-epoch resume ───────────
+        #   Chỉ skip khi đây đúng là epoch bị ngắt giữa chừng.
+        skip_batches = resume_skip_steps if (epoch == resume_epoch) else 0
+        if skip_batches > 0:
+            logger.info(
+                f"[Resume] Mid-epoch resume: epoch={epoch}, "
+                f"fast-forwarding {skip_batches} batches..."
+            )
 
         logger.info(f"\n{'='*60}")
         logger.info(f"EPOCH {epoch}/{args.epochs}  (mixed: {' + '.join(TASK_ORDER)})")
@@ -841,17 +950,27 @@ def train(args: argparse.Namespace) -> None:
             leave=False,
         )
 
-        running_loss   = 0.0
-        running_count  = 0
-        oom_skip_count = 0
+        running_loss    = 0.0
+        running_count   = 0
+        oom_skip_count  = 0
+        # steps_in_epoch đếm số batch thực sự đã xử lý trong epoch này
+        # (bao gồm cả OOM-skip; khớp với resume_skip_steps đã lưu)
+        steps_in_epoch  = 0
 
         for batch in train_loader:
-            # batch["task"] is a list like ["mmlu", "squad", "snli", "mmlu", ...]
-            # Summarise task composition for logging
             task_list = batch["task"]
 
+            # ── Fast-forward: skip batches đã hoàn thành trước khi resume ─────
+            if steps_in_epoch < skip_batches:
+                steps_in_epoch += 1
+                batch_pbar.update(1)
+                batch_pbar.set_postfix(status=f"fast-fwd {steps_in_epoch}/{skip_batches}")
+                continue
+
+            # ── OOM cooldown ──────────────────────────────────────────────────
             if oom_skip_count > 0:
                 oom_skip_count -= 1
+                steps_in_epoch += 1
                 batch_pbar.update(1)
                 batch_pbar.set_postfix(status=f"cooldown ({oom_skip_count} left)")
                 continue
@@ -884,7 +1003,6 @@ def train(args: argparse.Namespace) -> None:
                     raise
                 _cleanup_after_oom(optimizer, outputs, loss, input_ids, attention_mask, labels)
                 try:
-                    # report_oom reduces global batch_size and recomputes sub-batch sizes
                     new_global_bs  = train_loader.report_oom(task_list[0] if task_list else "mixed")
                     oom_skip_count = args.oom_skip_batches
                     logger.warning(
@@ -893,11 +1011,11 @@ def train(args: argparse.Namespace) -> None:
                         + ", ".join(f"{t}={train_loader.current_batch_sizes[t]}" for t in TASK_ORDER)
                         + f"  skip={oom_skip_count}"
                     )
-                    # Update batch_size in args so it's saved to state correctly
                     args.batch_size = new_global_bs
                 except RuntimeError as re:
                     logger.error(f"[OOM] Không thể giảm batch_size thêm: {re}")
                     raise
+                steps_in_epoch += 1
                 batch_pbar.update(1)
                 continue
 
@@ -919,10 +1037,11 @@ def train(args: argparse.Namespace) -> None:
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-            global_step  += 1
-            avg_loss      = running_loss / running_count
-            current_lr    = scheduler.get_last_lr()[0]
-            running_loss  = running_count = 0
+            global_step    += 1
+            steps_in_epoch += 1
+            avg_loss        = running_loss / running_count
+            current_lr      = scheduler.get_last_lr()[0]
+            running_loss    = running_count = 0
 
             # Count tasks in this batch for logging
             from collections import Counter as _Counter
@@ -931,7 +1050,7 @@ def train(args: argparse.Namespace) -> None:
             log_entry = {
                 "epoch":      epoch,
                 "step":       global_step,
-                "tasks":      task_counts,             # e.g. {"mmlu": 6, "squad": 5, "snli": 5}
+                "tasks":      task_counts,
                 "batch_size": len(task_list),
                 "loss":       round(avg_loss, 6),
                 "lr":         current_lr,
@@ -955,6 +1074,40 @@ def train(args: argparse.Namespace) -> None:
                 loss=f"{avg_loss:.4f}",
             )
 
+            # ── Mid-epoch checkpoint (save_iter) ──────────────────────────────
+            if args.save_iter > 0 and global_step % args.save_iter == 0:
+                logger.info(
+                    f"\n[SaveIter] global_step={global_step}  "
+                    f"(epoch={epoch}, steps_in_epoch={steps_in_epoch}) — pushing to Hub..."
+                )
+                mid_state = _build_training_state(
+                    args=args,
+                    hub_repo=hub_repo,
+                    completed_epochs=completed_epochs,
+                    epoch_results=epoch_results,
+                    global_step=global_step,
+                    train_loader=train_loader,
+                    current_epoch=epoch,
+                    steps_done_in_epoch=steps_in_epoch,  # số batch đã đi qua (kể cả skip)
+                    is_epoch_complete=False,
+                )
+                save_and_push_checkpoint(
+                    hub_repo=hub_repo,
+                    output_dir=output_dir,
+                    state=mid_state,
+                    model=model,
+                    tokenizer=tokenizer,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    loss_log=loss_log,
+                    epoch=epoch,
+                    private=args.hub_private,
+                    commit_suffix=f"step-{global_step}",
+                )
+                model.train()   # đảm bảo model về train mode sau push
+            # ─────────────────────────────────────────────────────────────────
+
         batch_pbar.close()
         logger.info(f"\n[Epoch {epoch}] Training done.  global_step={global_step}")
 
@@ -967,23 +1120,19 @@ def train(args: argparse.Namespace) -> None:
             plot_metrics(epoch_results, output_dir)
             plot_training_loss(loss_log, output_dir)
 
-        # ── Save & push ───────────────────────────────────────────────────────
+        # ── End-of-epoch Save & push ──────────────────────────────────────────
         completed_epochs.append(epoch)
-        state = {
-            "model_name":       args.model_name,
-            "hub_repo":         hub_repo,
-            "total_epochs":     args.epochs,
-            "completed_epochs": completed_epochs,
-            "freeze_layers":    args.freeze_layers,
-            # Save global batch_size (sub-batch sizes are derived from this)
-            "batch_size":       args.batch_size,
-            "sub_batch_sizes":  dict(train_loader.current_batch_sizes),
-            "lr":               args.lr,
-            "seed":             args.seed,
-            "epoch_results":    epoch_results,
-            "global_step":      global_step,
-            "timestamp":        time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        state = _build_training_state(
+            args=args,
+            hub_repo=hub_repo,
+            completed_epochs=completed_epochs,
+            epoch_results=epoch_results,
+            global_step=global_step,
+            train_loader=train_loader,
+            current_epoch=epoch,
+            steps_done_in_epoch=steps_in_epoch,
+            is_epoch_complete=True,   # ← epoch hoàn thành, không cần mid-epoch resume
+        )
 
         ckpt_path = output_dir / f"checkpoint_epoch{epoch}"
         ckpt_path.mkdir(parents=True, exist_ok=True)
@@ -1006,6 +1155,7 @@ def train(args: argparse.Namespace) -> None:
             loss_log=loss_log,
             epoch=epoch,
             private=args.hub_private,
+            commit_suffix="",   # end-of-epoch: không có suffix
         )
 
     epoch_pbar.close()
@@ -1073,6 +1223,7 @@ if __name__ == "__main__":
     logger.info(f"  grad_ckpt      : {args.gradient_checkpointing}")
     logger.info(f"  lr             : {args.lr}")
     logger.info(f"  bf16/fp16      : {args.bf16}/{args.fp16}")
+    logger.info(f"  save_iter      : {args.save_iter if args.save_iter > 0 else 'disabled'}")
     logger.info("=" * 60)
 
     train(args)
