@@ -30,8 +30,9 @@ LoRA placement
 
 Data
 ----
-  OPUS-100 : 5% sampling (opus_sample_ratio=0.05)
+  OPUS-100 : sampling theo --opus_ratio (mặc định 5%)
   FLORES-200: full (ratio=1.0)
+  Eng-Eng pairs: thêm vào theo --eng_eng_ratio (mặc định 0.0 = tắt)
   Dùng AlignmentDataLoader từ dataloader/alignment_dataloader.py
 
 Resume & Checkpoint
@@ -55,6 +56,8 @@ Usage
         --lr            2e-5 \\
         --lambda_ot     0.5 \\
         --sinkhorn_eps  0.1 \\
+        --opus_ratio    0.05 \\
+        --eng_eng_ratio 0.30 \\
         --save_iter     200
 """
 
@@ -159,10 +162,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora_alpha",      type=int,   default=32)
     p.add_argument("--lora_dropout",    type=float, default=0.05)
 
-    # OPUS sampling
-    p.add_argument("--opus_sample_ratio", type=float, default=0.05,
-                   help="Fraction của OPUS-100 để dùng (mặc định 5%)")
-    p.add_argument("--opus_sample_seed",  type=int, default=42)
+    # ── Data sampling ────────────────────────────────────────────────────────
+    # --opus_ratio   : tỷ lệ dữ liệu OPUS-100 được dùng, mặc định 5%
+    #                  tương ứng với opus_sample_ratio trong AlignmentDataset
+    # --eng_eng_ratio: tỷ lệ cặp eng-eng thêm vào so với joint records
+    #                  mặc định 0.0 = tắt hoàn toàn
+    p.add_argument(
+        "--opus_ratio",
+        type=float,
+        default=0.05,
+        help="Fraction của OPUS-100 để dùng, trong (0.0, 1.0] (mặc định 5%%)",
+    )
+    p.add_argument(
+        "--eng_eng_ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Tỷ lệ cặp eng-eng identity thêm vào so với joint records, "
+            "trong [0.0, 1.0]. 0.0 = tắt (mặc định). "
+            "Ví dụ: 0.30 → thêm eng-eng = 30%% số joint records."
+        ),
+    )
 
     # Mid-epoch save
     p.add_argument("--save_iter",       type=int, default=0,
@@ -883,7 +903,10 @@ def build_state(
         "lora_alpha":           args.lora_alpha,
         "batch_size":           args.batch_size,
         "lr":                   args.lr,
-        "opus_sample_ratio":    args.opus_sample_ratio,
+        # ── data sampling params ─────────────────────────────────────────────
+        "opus_ratio":           args.opus_ratio,
+        "eng_eng_ratio":        args.eng_eng_ratio,
+        # ────────────────────────────────────────────────────────────────────
         "timestamp":            time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -1020,11 +1043,16 @@ def train(args: argparse.Namespace) -> None:
     layer_weights_module = LayerWeights(n_layers=len(middle_layers)).to(device)
 
     # ── Alignment dataset ─────────────────────────────────────────────────────
-    logger.info("[Data] Loading alignment dataset...")
+    # Dùng args.opus_ratio  → truyền vào opus_sample_ratio của AlignmentDataset
+    # Dùng args.eng_eng_ratio → truyền vào eng_eng_ratio của AlignmentDataset
+    logger.info(
+        f"[Data] Loading alignment dataset  "
+        f"(opus_ratio={args.opus_ratio:.1%}, eng_eng_ratio={args.eng_eng_ratio:.1%}) ..."
+    )
     align_dataset = AlignmentDataset(
         alignment_data_path=args.data_root,
-        opus_sample_ratio=args.opus_sample_ratio,
-        opus_sample_seed=args.opus_sample_seed,
+        opus_sample_ratio=args.opus_ratio,
+        eng_eng_ratio=args.eng_eng_ratio,
     ).load()
     align_dataset.stats()
 
@@ -1215,11 +1243,6 @@ def train(args: argparse.Namespace) -> None:
             current_lr = scheduler.get_last_lr()[0]
             running_loss = running_lm = running_ot = running_count = 0
 
-            # Layer weights (softmax) for logging
-            lw_str = ", ".join(
-                f"{v:.3f}" for v in F.softmax(layer_weights_module.w.detach(), dim=0).tolist()
-            )
-
             log_entry = {
                 "epoch":     epoch,
                 "step":      global_step,
@@ -1326,16 +1349,20 @@ def train(args: argparse.Namespace) -> None:
 
     with open(output_dir / "ot_final_report.json", "w", encoding="utf-8") as f:
         json.dump({
-            "base_model":      args.base_model,
-            "hub_repo":        hub_repo,
-            "epochs":          args.epochs,
-            "completed_epochs":completed_epochs,
-            "global_step":     global_step,
-            "middle_layers":   middle_layers,
-            "lambda_ot":       args.lambda_ot,
-            "sinkhorn_eps":    args.sinkhorn_eps,
-            "lora_r":          args.lora_r,
-            "lora_alpha":      args.lora_alpha,
+            "base_model":        args.base_model,
+            "hub_repo":          hub_repo,
+            "epochs":            args.epochs,
+            "completed_epochs":  completed_epochs,
+            "global_step":       global_step,
+            "middle_layers":     middle_layers,
+            "lambda_ot":         args.lambda_ot,
+            "sinkhorn_eps":      args.sinkhorn_eps,
+            "lora_r":            args.lora_r,
+            "lora_alpha":        args.lora_alpha,
+            # ── data sampling params ─────────────────────────────────────────
+            "opus_ratio":        args.opus_ratio,
+            "eng_eng_ratio":     args.eng_eng_ratio,
+            # ────────────────────────────────────────────────────────────────
             "final_layer_weights": lw_final,
         }, f, indent=2, ensure_ascii=False)
 
@@ -1364,7 +1391,8 @@ if __name__ == "__main__":
     logger.info(f"  sinkhorn_iters   : {args.sinkhorn_iters}")
     logger.info(f"  middle_layers    : {args.middle_layers}")
     logger.info(f"  lora_r / alpha   : {args.lora_r} / {args.lora_alpha}")
-    logger.info(f"  opus_sample_ratio: {args.opus_sample_ratio:.1%}")
+    logger.info(f"  opus_ratio       : {args.opus_ratio:.1%}")
+    logger.info(f"  eng_eng_ratio    : {args.eng_eng_ratio:.1%}")
     logger.info(f"  save_iter        : {args.save_iter if args.save_iter > 0 else 'disabled'}")
     logger.info(f"  bf16/fp16        : {args.bf16}/{args.fp16}")
     logger.info("=" * 65)
