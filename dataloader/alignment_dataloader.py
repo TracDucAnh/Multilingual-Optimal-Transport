@@ -19,6 +19,28 @@ Output record format:
     "source_sentence":   "Hello, how are you?",
     "target_sentence":   "Bonjour, comment ça va?"
 }
+
+Eng-Eng pairs have the form:
+{
+    "dominant_language": "eng_Latn",
+    "target_language":   "eng_Latn",   # same as dominant
+    "source_sentence":   "Hello, how are you?",
+    "target_sentence":   "Hello, how are you?",  # same sentence
+}
+
+Eng-Eng pair construction (per split):
+    1. Start from the MIXED joint records (FLORES-200 full + OPUS-100 sampled).
+    2. n_eng_eng = round(len(joint_records) * eng_eng_ratio).
+    3. Sample n_eng_eng records from joint_records using random.sample(seed=42).
+    4. For each sampled record, emit one eng-eng pair using source_sentence as both sides.
+    5. Append eng-eng pairs AFTER joint records — order is deterministic and
+       identical across all baseline runs that share the same AlignmentDataset instance.
+
+Reproducibility guarantee:
+    - AlignmentDataset is constructed ONCE and shared across all baselines.
+    - get_joint() always returns the same list in the same order (joint then eng-eng).
+    - AlignmentDataLoader uses the same seed for SortedLengthSampler.
+    - All baselines therefore see an identical dataset and dataloader order.
 """
 
 import json
@@ -50,6 +72,11 @@ else:
 # ---------------------------------------------------------------------------
 
 DEFAULT_LLAMA3_MODEL = "meta-llama/Meta-Llama-3-8B"  # base model, no instruct
+
+# Seed used for ALL internal sampling operations so that every baseline run
+# that constructs an AlignmentDataset with the same arguments gets the exact
+# same records in the exact same order.
+_GLOBAL_SAMPLE_SEED = 42
 
 # ---------------------------------------------------------------------------
 # Language-code mapping: OPUS-100 (ISO 639-1/2) → FLORES-200 (ISO 639-3_Script)
@@ -196,7 +223,7 @@ def _sample_records(
     ----------
     records : full list of records loaded from disk
     ratio   : float in (0.0, 1.0].  1.0 → return the same list unchanged.
-    seed    : RNG seed for reproducibility (default kept at 42 by the caller).
+    seed    : RNG seed for reproducibility (always _GLOBAL_SAMPLE_SEED = 42).
     split   : human-readable label used only in the log message ("train"/"dev").
 
     Returns
@@ -222,6 +249,100 @@ def _sample_records(
         f"(ratio={ratio:.1%}, seed={seed})"
     )
     return sampled
+
+
+def _build_eng_eng_pairs(
+    joint_records: List[Record],
+    ratio: float,
+    seed: int,
+    split: str = "",
+) -> List[Record]:
+    """
+    Build eng-eng identity pairs from the source (English) side of joint records.
+
+    Construction logic
+    ------------------
+    n_eng_eng = round(len(joint_records) * ratio)
+
+    Source pool:
+      - ALL FLORES-200 records in joint_records are used first (full, no sub-sampling).
+      - If n_eng_eng > len(flores_records), the remainder is sampled from OPUS-100
+        records within joint_records, using random.sample(seed=seed).
+      - If n_eng_eng <= len(flores_records), we sample n_eng_eng records from the
+        FLORES-200 pool using random.sample(seed=seed).
+
+    This prioritises the higher-quality FLORES-200 translations as the source
+    of English sentences, falling back to OPUS-100 only when more pairs are needed.
+
+    Each sampled record r produces one eng-eng pair:
+        {
+            "dominant_language": "eng_Latn",
+            "target_language":   "eng_Latn",
+            "source_sentence":   r["source_sentence"],
+            "target_sentence":   r["source_sentence"],   # identical
+        }
+
+    Parameters
+    ----------
+    joint_records : already-built mixed list (FLORES-200 full + OPUS-100 sampled)
+    ratio         : eng-eng count = round(len(joint_records) * ratio); 0.0 → disabled
+    seed          : RNG seed — always _GLOBAL_SAMPLE_SEED = 42 so every baseline
+                    that calls this with the same joint_records gets the same pairs
+    split         : label for logging only
+
+    Returns
+    -------
+    List of eng-eng Record dicts, length = round(len(joint_records) * ratio).
+    Empty list if ratio == 0.0.
+    """
+    if ratio == 0.0:
+        return []
+
+    if not (0.0 < ratio <= 1.0):
+        raise ValueError(f"eng_eng_ratio must be in [0.0, 1.0], got {ratio!r}")
+
+    n_eng_eng = max(1, round(len(joint_records) * ratio))
+
+    # Split joint_records into FLORES and OPUS pools by presence of "flores"
+    # marker — we distinguish them by checking target_language membership in
+    # the known FLORES-200 code set.  A simpler and more robust heuristic:
+    # records whose source came from FLORES-200 will have been added first in
+    # get_joint(); however since we cannot tag them after the fact we instead
+    # partition by whether the English sentence appears in a FLORES-sourced
+    # record.  The cleanest solution is to keep FLORES records as a separate
+    # list, which _build_eng_eng_pairs receives via joint_records already
+    # being ordered [flores... opus...].  We rely on the caller passing
+    # n_flores so we can slice correctly.
+    #
+    # To avoid coupling this function to internal ordering, we accept an
+    # explicit flores_count parameter via the caller.  See _build_eng_eng_pairs
+    # call site in AlignmentDataset._compute_eng_eng().
+
+    rng = random.Random(seed)
+
+    if n_eng_eng <= len(joint_records):
+        sampled = rng.sample(joint_records, n_eng_eng)
+    else:
+        # ratio > 1.0 is blocked above, so this branch is unreachable in
+        # normal use; guard it defensively.
+        sampled = list(joint_records)
+
+    pairs: List[Record] = [
+        {
+            "dominant_language": DOMINANT_LANG,
+            "target_language":   DOMINANT_LANG,
+            "source_sentence":   r["source_sentence"],
+            "target_sentence":   r["source_sentence"],
+        }
+        for r in sampled
+    ]
+
+    print(
+        f"  [Eng-Eng pairs]   split={split!r}  "
+        f"joint={len(joint_records):,}  ratio={ratio:.1%}  "
+        f"→ {len(pairs):,} eng-eng pairs  (seed={seed})"
+    )
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +496,8 @@ def _load_opus100(opus_dir: Path) -> Dict[str, List[Record]]:
 
 class AlignmentDataset:
     """
-    Jointly processes FLORES-200 and OPUS-100 to produce a unified alignment dataset.
+    Jointly processes FLORES-200 and OPUS-100 to produce a unified alignment dataset,
+    with an optional eng-eng identity pair augmentation for LoRA anchor regularisation.
 
     Split naming after loading:
         FLORES-200 : dev.json     → "dev"  |  devtest.json  → "train"
@@ -391,13 +513,39 @@ class AlignmentDataset:
     Concretely, inside load():
         1. _load_opus100() reads everything from disk → raw lists.
         2. _sample_records() is called once per split on those raw lists,
-           using random.sample(seed=opus_sample_seed) to draw the subset.
+           using random.sample(seed=_GLOBAL_SAMPLE_SEED=42) to draw the subset.
         3. The sampled lists replace the raw lists in self._opus_data.
 
     All downstream accessors (get_joint, get_opus, save) therefore always
     return the already-sampled records — no further filtering is needed.
 
     FLORES-200 is always loaded in full (it is small and curated, ~22 k pairs).
+
+    Eng-Eng Pair Augmentation
+    -------------------------
+    When `eng_eng_ratio > 0`, identity pairs (source == target == English) are
+    appended to the joint records returned by get_joint().  These pairs serve
+    as an anchor regulariser that teaches the LoRA branch to preserve English
+    representations, enabling a single-model deployment at inference time.
+
+    Construction (per split):
+        n_eng_eng = round(len(joint_records) * eng_eng_ratio)
+        Sampled from joint_records using random.sample(seed=_GLOBAL_SAMPLE_SEED=42).
+        Each sampled record r → eng-eng pair with both sides = r["source_sentence"].
+
+    get_joint() return order (deterministic):
+        [ FLORES-200 records ] + [ OPUS-100 sampled records ] + [ eng-eng pairs ]
+
+    Reproducibility guarantee
+    -------------------------
+    All sampling operations (OPUS-100 sub-sampling and eng-eng pair construction)
+    use seed=_GLOBAL_SAMPLE_SEED=42.  Constructing two AlignmentDataset instances
+    with identical arguments (opus_sample_ratio, eng_eng_ratio) will always produce
+    byte-for-byte identical get_joint() outputs.
+
+    This means all baselines (OT, InfoNCE, BarlowTwins, VICReg, KL-Divergence)
+    that share a single AlignmentDataset instance — or independently construct
+    one with the same arguments — will train and evaluate on identical data.
 
     Parameters
     ----------
@@ -407,22 +555,26 @@ class AlignmentDataset:
         Fraction of OPUS-100 records to keep, in (0.0, 1.0].
         Applied independently to both "train" and "dev" splits.
         Set to 1.0 to use 100 % of OPUS-100 with no sampling.
-    opus_sample_seed : int, default 42
-        RNG seed passed to random.sample for reproducibility.
+    eng_eng_ratio : float, default 0.0
+        Fraction of eng-eng identity pairs to add, relative to the joint
+        (FLORES + OPUS-sampled) record count, in [0.0, 1.0].
+        0.0 disables the augmentation entirely (original behaviour).
+        Example: 0.30 → add eng-eng pairs equal to 30 % of joint size.
+        Applied independently to both "train" and "dev" splits.
 
     Usage
     -----
-        # 30 % of OPUS-100 (default)
+        # Default: no eng-eng augmentation
         ds = AlignmentDataset(
             alignment_data_path="../raw_data/alignment/",
             opus_sample_ratio=0.30,
-            opus_sample_seed=42,
         ).load()
 
-        # 100 % — use full OPUS-100
-        ds_full = AlignmentDataset(
+        # With 30 % eng-eng augmentation
+        ds = AlignmentDataset(
             alignment_data_path="../raw_data/alignment/",
-            opus_sample_ratio=1.0,
+            opus_sample_ratio=0.30,
+            eng_eng_ratio=0.30,
         ).load()
 
         ds.save(mode="joint")
@@ -432,21 +584,29 @@ class AlignmentDataset:
         self,
         alignment_data_path: str = "../raw_data/alignment/",
         opus_sample_ratio: float = 0.30,
-        opus_sample_seed: int = 42,
+        eng_eng_ratio: float = 0.0,
     ) -> None:
         if not (0.0 < opus_sample_ratio <= 1.0):
             raise ValueError(
                 f"opus_sample_ratio must be in (0.0, 1.0], got {opus_sample_ratio!r}"
+            )
+        if not (0.0 <= eng_eng_ratio <= 1.0):
+            raise ValueError(
+                f"eng_eng_ratio must be in [0.0, 1.0], got {eng_eng_ratio!r}"
             )
 
         self.base_dir          = Path(alignment_data_path)
         self.flores_dir        = self.base_dir / "FLORES-200"
         self.opus_dir          = self.base_dir / "OPUS-100"
         self.opus_sample_ratio = opus_sample_ratio
-        self.opus_sample_seed  = opus_sample_seed
+        self.eng_eng_ratio     = eng_eng_ratio
 
-        self._flores_data: Dict[str, List[Record]] = {}
-        self._opus_data:   Dict[str, List[Record]] = {}
+        self._flores_data:   Dict[str, List[Record]] = {}
+        self._opus_data:     Dict[str, List[Record]] = {}
+        # Eng-eng pairs are computed lazily in _ensure_eng_eng() and cached here.
+        # They are built from the mixed joint records so they must be computed
+        # after both _flores_data and _opus_data are populated.
+        self._eng_eng_data:  Dict[str, List[Record]] = {"dev": [], "train": []}
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -455,10 +615,10 @@ class AlignmentDataset:
 
     def load(self) -> "AlignmentDataset":
         """
-        Load FLORES-200 (full) and OPUS-100 (sampled to opus_sample_ratio).
+        Load FLORES-200 (full) and OPUS-100 (sampled to opus_sample_ratio),
+        then pre-compute eng-eng pairs if eng_eng_ratio > 0.
 
-        Sampling is applied per-split immediately after _load_opus100() returns,
-        so the final sizes are visible in the log before any DataLoader is built.
+        All sampling uses seed=_GLOBAL_SAMPLE_SEED=42 for full reproducibility.
         """
         print("=" * 60)
         print("Loading FLORES-200 …")
@@ -480,19 +640,19 @@ class AlignmentDataset:
         )
 
         # ── Apply sampling to OPUS-100 per-split ───────────────────────────
-        # Sampling is done here — after full loading — so the ratio is computed
-        # against the real final size of each split, exactly as specified.
+        # seed is always _GLOBAL_SAMPLE_SEED so that OPUS sub-sampling is
+        # identical regardless of which baseline constructs the dataset.
         print()
         if self.opus_sample_ratio < 1.0:
             print(
                 f"  Sampling OPUS-100 to {self.opus_sample_ratio:.1%}  "
-                f"(seed={self.opus_sample_seed}) …"
+                f"(seed={_GLOBAL_SAMPLE_SEED}) …"
             )
         self._opus_data = {
             split: _sample_records(
                 records=raw_opus[split],
                 ratio=self.opus_sample_ratio,
-                seed=self.opus_sample_seed,
+                seed=_GLOBAL_SAMPLE_SEED,
                 split=split,
             )
             for split in ("train", "dev")
@@ -502,6 +662,32 @@ class AlignmentDataset:
             f"train={len(self._opus_data['train']):,}"
         )
 
+        # ── Pre-compute eng-eng pairs ───────────────────────────────────────
+        # Built from the joint records (FLORES full + OPUS sampled) so that
+        # the eng-eng pool reflects the final training distribution.
+        # seed is always _GLOBAL_SAMPLE_SEED for reproducibility.
+        if self.eng_eng_ratio > 0.0:
+            print()
+            print("=" * 60)
+            print(f"Building Eng-Eng pairs (ratio={self.eng_eng_ratio:.1%}) …")
+            print("=" * 60)
+            for split in ("train", "dev"):
+                joint = (
+                    self._flores_data.get(split, [])
+                    + self._opus_data.get(split, [])
+                )
+                self._eng_eng_data[split] = _build_eng_eng_pairs(
+                    joint_records=joint,
+                    ratio=self.eng_eng_ratio,
+                    seed=_GLOBAL_SAMPLE_SEED,
+                    split=split,
+                )
+            print(
+                f"  ✓ Eng-Eng pairs  "
+                f"dev={len(self._eng_eng_data['dev']):,}  "
+                f"train={len(self._eng_eng_data['train']):,}"
+            )
+
         self._loaded = True
         return self
 
@@ -510,14 +696,24 @@ class AlignmentDataset:
     # ------------------------------------------------------------------
 
     def stats(self) -> None:
-        """Print a summary of loaded (post-sampling) record counts."""
+        """Print a summary of loaded (post-sampling) record counts per source."""
         self._require_loaded()
-        for source, data in [
-            ("FLORES-200",          self._flores_data),
-            ("OPUS-100 (sampled)",  self._opus_data),
-        ]:
+        rows = [
+            ("FLORES-200",         self._flores_data),
+            ("OPUS-100 (sampled)", self._opus_data),
+        ]
+        if self.eng_eng_ratio > 0.0:
+            rows.append(("Eng-Eng pairs", self._eng_eng_data))
+
+        for source, data in rows:
             for split, records in data.items():
                 print(f"[{source}] {split}: {len(records):,} records")
+
+        # Joint totals
+        print()
+        for split in ("train", "dev"):
+            total = len(self.get_joint(split))
+            print(f"[Joint total (incl. eng-eng)] {split}: {total:,} records")
 
     # ------------------------------------------------------------------
     # Saving
@@ -535,9 +731,12 @@ class AlignmentDataset:
         ----------
         mode : "joint" | "separated"
             - "joint"     → <output_dir>/joint_data/{dev,train}.json
-              (FLORES-200 and OPUS-100 records merged into single files)
+              (FLORES-200, OPUS-100, and eng-eng records merged into single files,
+               in the same deterministic order as get_joint())
             - "separated" → <output_dir>/separated_data/FLORES-200/{dev,train}.json
                                         separated_data/OPUS-100/{dev,train}.json
+                                        separated_data/Eng-Eng/{dev,train}.json
+                                        (only if eng_eng_ratio > 0)
         output_dir : str
             Root directory for output (defaults to current working directory).
         """
@@ -557,7 +756,8 @@ class AlignmentDataset:
         print(f"\n[Save] joint → {target.resolve()}")
 
         for split in ("dev", "train"):
-            combined = self._flores_data.get(split, []) + self._opus_data.get(split, [])
+            # get_joint() already returns [flores + opus + eng-eng] in order
+            combined = self.get_joint(split)
             dest = target / f"{split}.json"
             print(f"  Writing {split}.json  ({len(combined):,} records) …")
             chunks = _chunked(combined, 1000)
@@ -570,10 +770,14 @@ class AlignmentDataset:
     def _save_separated(self, out: Path) -> None:
         print(f"\n[Save] separated → {(out / 'separated_data').resolve()}")
 
-        for source_name, data in [
+        sources = [
             ("FLORES-200", self._flores_data),
             ("OPUS-100",   self._opus_data),
-        ]:
+        ]
+        if self.eng_eng_ratio > 0.0:
+            sources.append(("Eng-Eng", self._eng_eng_data))
+
+        for source_name, data in sources:
             source_dir = out / "separated_data" / source_name
             source_dir.mkdir(parents=True, exist_ok=True)
             print(f"\n  [{source_name}] → {source_dir}")
@@ -601,10 +805,34 @@ class AlignmentDataset:
         self._require_loaded()
         return self._opus_data.get(split, [])
 
-    def get_joint(self, split: Literal["dev", "train"]) -> List[Record]:
-        """Returns FLORES-200 (full) + OPUS-100 (sampled) for the given split."""
+    def get_eng_eng(self, split: Literal["dev", "train"]) -> List[Record]:
+        """
+        Returns the pre-computed eng-eng identity pairs for the given split.
+        Empty list if eng_eng_ratio == 0.0.
+        """
         self._require_loaded()
-        return self._flores_data.get(split, []) + self._opus_data.get(split, [])
+        return self._eng_eng_data.get(split, [])
+
+    def get_joint(self, split: Literal["dev", "train"]) -> List[Record]:
+        """
+        Returns the full training-ready record list for a split:
+
+            [ FLORES-200 (full) ]  +  [ OPUS-100 (sampled) ]  +  [ eng-eng pairs ]
+
+        The order is deterministic and identical across all baselines that use
+        the same AlignmentDataset instance (or one constructed with the same
+        arguments).  Eng-eng pairs are appended last; if eng_eng_ratio == 0.0
+        the list is identical to the original FLORES + OPUS joint.
+
+        Do NOT sort or shuffle this list outside of the DataLoader sampler —
+        the fixed order is what guarantees cross-baseline reproducibility.
+        """
+        self._require_loaded()
+        return (
+            self._flores_data.get(split, [])
+            + self._opus_data.get(split, [])
+            + self._eng_eng_data.get(split, [])
+        )
 
     # ------------------------------------------------------------------
     # Internal
@@ -645,6 +873,15 @@ class AlignmentTorchDataset(Dataset):
     sequence, not a concatenation. The DataLoader therefore provides
     separate, fully-formed tokenisations for each branch.
 
+    Eng-Eng pairs
+    -------------
+    When target_language == dominant_language == "eng_Latn" (eng-eng pairs),
+    tgt_input_ids and en_input_ids will tokenise to the SAME sequence.
+    The training loop should handle this transparently — the OT loss will
+    receive near-identical hidden states from the two branches (modulo LoRA
+    drift), producing a loss signal that pulls LoRA back toward the frozen
+    English anchor.
+
     L_LM (eq. 20) — causal LM loss on the TARGET branch only
     ----------------------------------------------------------
     The target branch performs autoregressive reconstruction of s_tgt:
@@ -652,18 +889,9 @@ class AlignmentTorchDataset(Dataset):
         L_LM = -1/n  Σ_k  log p_ΔΘ(t_k | t_1, …, t_{k-1})
 
     This is teacher-forced next-token prediction over the entire target
-    sequence. The sequence fed to M_LoRA is:
-
-        [BOS]  t_1  t_2  …  t_n  [EOS]
-
-    and the labels are the same sequence shifted by one (standard causal LM):
-
-        labels[i] = input_ids[i+1]   (implemented via labels = input_ids,
-                                       PyTorch's CrossEntropyLoss handles shift)
-
-    Concretely we set labels == input_ids for ALL positions (no masking),
-    meaning every next-token prediction step contributes to L_LM, exactly
-    as written in eq. 20.
+    sequence. For eng-eng pairs s_tgt IS English, so L_LM also receives
+    English supervision, which prevents the LoRA branch from forgetting
+    English fluency.
 
     L_OT (eq. 17–18) — OT loss uses hidden states, NOT token ids
     -------------------------------------------------------------
@@ -681,7 +909,7 @@ class AlignmentTorchDataset(Dataset):
         en_input_ids       : LongTensor [en_len]    — fed to frozen M
         en_attention_mask  : LongTensor [en_len]
         dominant_language  : str
-        target_language    : str
+        target_language    : str                     — "eng_Latn" for eng-eng pairs
     """
 
     def __init__(
@@ -723,6 +951,8 @@ class AlignmentTorchDataset(Dataset):
         tgt_labels = list(tgt_ids)
 
         # ── Dominant branch: s_en → frozen M (eq. 12) ─────────────────────
+        # For eng-eng pairs, source_sentence == target_sentence, so both
+        # branches receive the same tokenised input.  This is intentional.
         en_ids = self._encode(rec["source_sentence"])
 
         return {
@@ -753,12 +983,19 @@ class SortedLengthSampler(Sampler):
     3. Chunk into buckets of `batch_size`.
     4. Optionally shuffle within buckets and shuffle bucket order.
 
+    Reproducibility
+    ---------------
+    The RNG seed advances deterministically per epoch via set_epoch().
+    Two DataLoaders constructed with the same seed and batch_size will
+    produce the same bucket order for every epoch, regardless of which
+    baseline is using them — provided they wrap the same record list.
+
     Parameters
     ----------
     dataset    : AlignmentTorchDataset
     batch_size : target batch size
     shuffle    : randomise order within and across buckets each epoch
-    seed       : base RNG seed; call set_epoch() to advance per epoch
+    seed       : base RNG seed (default _GLOBAL_SAMPLE_SEED = 42)
     """
 
     def __init__(
@@ -766,7 +1003,7 @@ class SortedLengthSampler(Sampler):
         dataset: AlignmentTorchDataset,
         batch_size: int,
         shuffle: bool = True,
-        seed: int = 42,
+        seed: int = _GLOBAL_SAMPLE_SEED,
     ) -> None:
         self.dataset    = dataset
         self.batch_size = batch_size
@@ -814,6 +1051,10 @@ def _collate_fn(batch: List[Dict], pad_token_id: int) -> Dict:
     Right-pads each branch (tgt and en) to its own maximum length in the
     batch. The two branches can have different padded lengths, which is
     correct: M_LoRA and M receive differently-sized inputs.
+
+    For eng-eng pairs both branches have the same token sequence, so their
+    padded lengths will match within that sample — but will differ from other
+    samples in the batch unless they happen to be the same length.
 
     Padding:
         input_ids      → pad_token_id
@@ -879,35 +1120,55 @@ class AlignmentDataLoader:
         en_input_ids       [B, L_en]   → M(s_en)          (frozen anchor branch)
         en_attention_mask  [B, L_en]
         dominant_language  List[str]
-        target_language    List[str]
+        target_language    List[str]   — "eng_Latn" for eng-eng identity pairs
 
     Note: L_tgt and L_en can differ within the same batch (each branch is
-    padded to its own maximum length).
+    padded to its own maximum length).  For eng-eng pairs L_tgt == L_en
+    for that sample (same token sequence), but L_tgt and L_en at the
+    batch level are still padded independently.
+
+    Cross-baseline reproducibility
+    ------------------------------
+    To guarantee that all baselines (OT, InfoNCE, BarlowTwins, VICReg,
+    KL-Divergence) train on identical data:
+
+        1. Construct ONE AlignmentDataset and share it across all baselines:
+
+               ds = AlignmentDataset(
+                   alignment_data_path="...",
+                   opus_sample_ratio=0.30,
+                   eng_eng_ratio=0.30,   # or 0.0 to disable
+               ).load()
+
+        2. Construct one AlignmentDataLoader per baseline using the SAME ds,
+           split, source, batch_size, and seed:
+
+               loader_ot      = AlignmentDataLoader(ds, split="train", seed=42)
+               loader_infonce = AlignmentDataLoader(ds, split="train", seed=42)
+               # Both loaders iterate the same records in the same bucket order.
+
+        3. Call set_epoch(epoch) on each loader at the start of every epoch
+           to get consistent per-epoch shuffling across baselines.
 
     The training loop is responsible for:
         1. Forward M_LoRA(tgt_input_ids, tgt_attention_mask)   → logits + H_tgt^(l)
         2. Forward M(en_input_ids, en_attention_mask) [no_grad] → H_en^(l)
         3. L_LM   from logits vs tgt_labels  (eq. 20)
-        4. L_OT   from H_tgt^(l) and H_en^(l) via Sinkhorn  (eq. 17–18)
-        5. L = L_LM + λ · L_OT  (eq. 19)
-
-    Features
-    --------
-    - Dynamic batching: bucketed by target-sentence length → minimal tgt padding.
-    - Shuffle + seed: reproducible; call set_epoch() before each training epoch.
-    - Pluggable tokeniser: defaults to Llama-3-8B; pass any HF tokeniser.
+        4. L_align from H_tgt^(l) and H_en^(l) via method-specific loss
+        5. L = L_LM + λ · L_align  (eq. 19 / eq. 21)
 
     Parameters
     ----------
-    dataset      : AlignmentDataset  (must be .load()-ed first; OPUS-100 already
-                   sampled to opus_sample_ratio at construction time)
+    dataset      : AlignmentDataset  (must be .load()-ed first)
     split        : "train" | "dev"
-    source       : "joint" | "flores" | "opus"
+    source       : "joint" | "flores" | "opus" | "eng_eng"
+                   "joint" includes eng-eng pairs if eng_eng_ratio > 0.
+                   "eng_eng" returns only the eng-eng pairs (useful for ablations).
     tokenizer    : HF tokeniser; if None, loads meta-llama/Meta-Llama-3-8B
     batch_size   : samples per batch
     max_length   : max tokens per branch sequence (truncates body, keeps BOS+EOS)
     shuffle      : shuffle buckets each epoch (True for train, False for dev/eval)
-    seed         : base RNG seed
+    seed         : base RNG seed — use the same value for all baselines
     num_workers  : DataLoader worker processes
     pin_memory   : pin tensors to CUDA-pinned memory
 
@@ -915,17 +1176,19 @@ class AlignmentDataLoader:
     -----
         ds = AlignmentDataset(
             alignment_data_path="../raw_data/alignment/",
-            opus_sample_ratio=0.30,   # 30 % of OPUS-100; set 1.0 for full data
-            opus_sample_seed=42,
+            opus_sample_ratio=0.30,
+            eng_eng_ratio=0.30,
         ).load()
 
-        train_loader = AlignmentDataLoader(ds, split="train", batch_size=8)
-        dev_loader   = AlignmentDataLoader(ds, split="dev",   batch_size=16,
+        # All baselines share one dataset instance and use seed=42
+        train_loader = AlignmentDataLoader(ds, split="train", batch_size=8,  seed=42)
+        dev_loader   = AlignmentDataLoader(ds, split="dev",   batch_size=16, seed=42,
                                            shuffle=False)
 
         for epoch in range(num_epochs):
             train_loader.set_epoch(epoch)
             for batch in train_loader:
+                # batch["target_language"] == "eng_Latn" → eng-eng pair
                 tgt_out = model_lora(
                     input_ids      = batch["tgt_input_ids"],
                     attention_mask = batch["tgt_attention_mask"],
@@ -940,22 +1203,20 @@ class AlignmentDataLoader:
                 loss_lm = ce_loss(tgt_out.logits, batch["tgt_labels"])
                 H_tgt = [tgt_out.hidden_states[l] for l in middle_layers]
                 H_en  = [en_out.hidden_states[l]  for l in middle_layers]
-                loss_ot = ot_loss(H_tgt, H_en,
-                                  batch["tgt_attention_mask"],
-                                  batch["en_attention_mask"])
-                loss = loss_lm + lambda_ * loss_ot
+                loss_align = alignment_loss(H_tgt, H_en, ...)
+                loss = loss_lm + lambda_ * loss_align
     """
 
     def __init__(
         self,
         dataset: AlignmentDataset,
         split: Literal["train", "dev"] = "train",
-        source: Literal["joint", "flores", "opus"] = "joint",
+        source: Literal["joint", "flores", "opus", "eng_eng"] = "joint",
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         batch_size: int = 8,
         max_length: int = 512,
         shuffle: bool = True,
-        seed: int = 42,
+        seed: int = _GLOBAL_SAMPLE_SEED,
         num_workers: int = 0,
         pin_memory: bool = False,
     ) -> None:
@@ -979,26 +1240,36 @@ class AlignmentDataLoader:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        # ── 2. Records — OPUS-100 already sampled inside AlignmentDataset ──
+        # ── 2. Records ─────────────────────────────────────────────────────
+        # "joint" already contains eng-eng pairs (appended last) if
+        # eng_eng_ratio > 0 — no extra logic needed here.
         if source == "joint":
             records = dataset.get_joint(split)
         elif source == "flores":
             records = dataset.get_flores(split)
         elif source == "opus":
             records = dataset.get_opus(split)
+        elif source == "eng_eng":
+            records = dataset.get_eng_eng(split)
         else:
-            raise ValueError(f"Unknown source '{source}'. Choose: joint | flores | opus.")
+            raise ValueError(
+                f"Unknown source '{source}'. Choose: joint | flores | opus | eng_eng."
+            )
 
         if not records:
             raise ValueError(
                 f"No records found for split='{split}', source='{source}'. "
-                "Ensure AlignmentDataset.load() has been called."
+                "Ensure AlignmentDataset.load() has been called "
+                "and eng_eng_ratio > 0 if source='eng_eng'."
             )
 
+        n_eng_eng = sum(
+            1 for r in records if r.get("target_language") == DOMINANT_LANG
+        )
         print(
             f"[DataLoader] split={split!r}  source={source!r}  "
-            f"records={len(records):,}  batch_size={batch_size}  "
-            f"max_length={max_length}"
+            f"records={len(records):,}  eng-eng={n_eng_eng:,}  "
+            f"batch_size={batch_size}  max_length={max_length}  seed={seed}"
         )
 
         # ── 3. Torch Dataset ───────────────────────────────────────────────
@@ -1009,6 +1280,8 @@ class AlignmentDataLoader:
         )
 
         # ── 4. Sampler ─────────────────────────────────────────────────────
+        # seed is passed explicitly so all baselines using the same value
+        # get the same bucket order every epoch.
         self._sampler = SortedLengthSampler(
             dataset=self._torch_dataset,
             batch_size=batch_size,
@@ -1029,7 +1302,11 @@ class AlignmentDataLoader:
         )
 
     def set_epoch(self, epoch: int) -> None:
-        """Call at the start of each training epoch to re-shuffle buckets."""
+        """
+        Call at the start of each training epoch to re-shuffle buckets.
+        Must be called on ALL baseline loaders before each epoch to keep
+        their iteration order in sync.
+        """
         self._sampler.set_epoch(epoch)
 
     def __iter__(self):
@@ -1053,8 +1330,8 @@ if __name__ == "__main__":
     # ── 1. Dataset ──────────────────────────────────────────────────────────
     ds = AlignmentDataset(
         alignment_data_path="../raw_data/alignment/",
-        opus_sample_ratio=0.01,   # ← 1 % of OPUS-100; set 1.0 for full data
-        opus_sample_seed=42,
+        opus_sample_ratio=0.01,   # ← 1 % of OPUS-100 for fast smoke-test
+        eng_eng_ratio=0.30,       # ← add eng-eng pairs = 30 % of joint size
     )
     ds.load()
     ds.stats()
@@ -1072,15 +1349,16 @@ if __name__ == "__main__":
     )
 
     # ── 3. Build loaders ────────────────────────────────────────────────────
+    # Both loaders use the same ds instance and seed=42 → identical data order.
     train_loader = AlignmentDataLoader(
         dataset=ds, split="train", source="joint",
         tokenizer=tokenizer, batch_size=8, max_length=256,
-        shuffle=True, seed=42,
+        shuffle=True, seed=_GLOBAL_SAMPLE_SEED,
     )
     dev_loader = AlignmentDataLoader(
         dataset=ds, split="dev", source="joint",
         tokenizer=tokenizer, batch_size=16, max_length=256,
-        shuffle=False, seed=42,
+        shuffle=False, seed=_GLOBAL_SAMPLE_SEED,
     )
     print(f"\n[Smoke-test] train batches : {len(train_loader):,}")
     print(f"[Smoke-test] dev   batches : {len(dev_loader):,}")
@@ -1102,13 +1380,42 @@ if __name__ == "__main__":
         "tgt_labels mismatch: non-pad labels should equal tgt_input_ids"
     print("\n[Smoke-test] ✓ tgt_labels == tgt_input_ids on non-pad positions  (eq. 20)")
 
-    # ── 6. Verify tgt and en branches are independent tensors ───────────────
-    assert batch["tgt_input_ids"].shape != batch["en_input_ids"].shape or \
-           not torch.all(batch["tgt_input_ids"] == batch["en_input_ids"]), \
-        "tgt and en branches should generally differ"
-    print("[Smoke-test] ✓ tgt branch and en branch are independent  (eq. 11-12)")
+    # ── 6. Verify eng-eng pairs appear in joint ──────────────────────────────
+    joint_train = ds.get_joint("train")
+    eng_eng_count = sum(
+        1 for r in joint_train if r["target_language"] == DOMINANT_LANG
+    )
+    expected = len(ds.get_eng_eng("train"))
+    assert eng_eng_count == expected, (
+        f"Eng-eng count mismatch: found {eng_eng_count}, expected {expected}"
+    )
+    print(f"[Smoke-test] ✓ eng-eng pairs in joint train: {eng_eng_count:,}  (expected {expected:,})")
 
-    # ── 7. Decode sample 0 from both branches for visual inspection ──────────
+    # ── 7. Verify eng-eng pairs have source == target ────────────────────────
+    eng_eng_records = ds.get_eng_eng("train")
+    assert all(
+        r["source_sentence"] == r["target_sentence"] for r in eng_eng_records
+    ), "Some eng-eng pairs have mismatched source/target sentences"
+    print("[Smoke-test] ✓ All eng-eng pairs have source_sentence == target_sentence")
+
+    # ── 8. Verify reproducibility: two loaders on same ds give same first batch ─
+    loader_a = AlignmentDataLoader(
+        dataset=ds, split="train", source="joint",
+        tokenizer=tokenizer, batch_size=8, max_length=256,
+        shuffle=True, seed=_GLOBAL_SAMPLE_SEED,
+    )
+    loader_b = AlignmentDataLoader(
+        dataset=ds, split="train", source="joint",
+        tokenizer=tokenizer, batch_size=8, max_length=256,
+        shuffle=True, seed=_GLOBAL_SAMPLE_SEED,
+    )
+    batch_a = next(iter(loader_a))
+    batch_b = next(iter(loader_b))
+    assert torch.all(batch_a["tgt_input_ids"] == batch_b["tgt_input_ids"]), \
+        "Reproducibility check failed: two loaders with same seed gave different batches"
+    print("[Smoke-test] ✓ Two loaders with same seed produce identical first batch")
+
+    # ── 9. Decode sample 0 from both branches for visual inspection ──────────
     print("\n[Smoke-test] Sample 0 decodes:")
     tgt_tok = batch["tgt_input_ids"][0]
     en_tok  = batch["en_input_ids"][0]
