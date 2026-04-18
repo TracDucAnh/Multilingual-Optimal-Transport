@@ -1,66 +1,40 @@
 """
 Llama3-8B-OT-optimized.py
 ==========================
-Stage 2 — Cross-lingual Optimal Transport Alignment  [OPTIMIZED VERSION]
+Stage 2 — Cross-lingual Optimal Transport Alignment
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-KEY OPTIMISATIONS vs original
+PAPER FORMULATIONS STRICTLY IMPLEMENTED
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-[OPT-1] BATCHED SINKHORN — eliminates Python for-loop over batch
-    Original: for b in range(B): sinkhorn(h_t[b], h_e[b])  → B serial calls
-    Fixed:    sinkhorn_log_batched(H_tgt, H_dom)            → 1 GPU kernel call
-    Speedup:  ~B× on GPU (batch_size=8 → 8× faster per layer)
-
-[OPT-2] NO output_attentions — removes heavyweight attention materialisation
-    Original: output_attentions=True  → B×H×s×s tensors per layer (O(Bs²H) RAM)
-    Fixed:    mean-pool hidden states directly via attention_mask
-    Why OK:   Attention-weighted pooling approximated by mask-mean is nearly
-              identical in practice (all tokens equally informative for alignment)
-              and eliminates the largest single memory allocation in forward().
-    RAM saved: for B=8, s=256, H=32 layers, 32 heads → ~2 GB VRAM freed per batch
-
-[OPT-3] SINGLE FORWARD PASS — one model call per batch instead of two
-    Original: forward(tgt) → disable_adapters → forward(en) → enable_adapters
-              Each forward is a separate CUDA graph, adapter toggle causes sync.
-    Fixed:    Concatenate [tgt; en] along batch dim → single forward → split
-              → 1 kernel launch overhead, full GPU utilisation, no sync barriers.
-    Note:     For models using PEFT, we set lora_dropout=0 at inference of en-half
-              and rely on the fact that the en-half's LoRA weights cancel out when
-              we zero-out their contribution via a custom hook (see _install_hooks).
-
-    ALTERNATIVE (used here): Two-pass but with torch.compile + CUDA graphs,
-    adapter toggle replaced by a boolean flag inside a custom forward wrapper.
-    This avoids the PEFT internal Python overhead of enable/disable.
-
-[OPT-4] VECTORISED COST MATRIX — torch.cdist instead of manual mm
-    C = 1 - mm(H_tgt, H_dom.T) is fine for 2D, but batched version needs bmm.
-    We use F.normalize + torch.bmm which is fused in cuBLAS.
-
-[OPT-5] TORCH.COMPILE on Sinkhorn kernel
-    @torch.compile with mode="reduce-overhead" eliminates Python overhead in the
-    Sinkhorn iteration loop (50 iterations × B × L layers = 50×8×16 = 6400 Python
-    calls → 1 compiled graph).
-
-[OPT-6] GRADIENT ACCUMULATION with proper scaling
-    Decouples effective batch size from VRAM constraints. Default accum=4.
-
-[OPT-7] FROZEN BRANCH CACHING with @torch.no_grad + inference_mode
-    en-branch uses torch.inference_mode() (faster than no_grad, skips autograd
-    version tracking entirely).
-
-[OPT-8] PRE-FETCHING DataLoader with persistent_workers + prefetch_factor
-    Keeps CPU workers alive between epochs, pre-loads next batch while GPU trains.
-
-[OPT-9] FUSED ADAMW (use_fused=True)
-    PyTorch 2.0+ fused AdamW kernel: ~5× faster optimizer step on CUDA.
-
-[OPT-10] LOSS COMPUTED IN float32, BACKWARD IN bf16
-    Sinkhorn is numerically sensitive — cast cost/transport to float32,
-    return scalar, let autocast handle the rest.
+Eq. 11-12  : Two forward branches — LoRA (target) vs frozen (dominant/EN)
+Eq. 13     : H̃(l) = diag(α(l)) · H(l)  where α(l) = mean attention over heads
+Eq. 14     : Row-wise L2 normalise of H̃(l) to get h(l)_tgt,i  and h(l)_dom,j
+Eq. 15     : Uniform marginals  a_i = 1/s_tgt,  b_j = 1/s_en
+Eq. 16     : C(l)_ij = 1 − ⟨h(l)_tgt,i , h(l)_dom,j⟩  (cosine distance on unit vecs)
+Eq. 17     : OT(l) = ⟨C(l), T*(l)⟩_F    (plain Frobenius inner product, no division)
+Eq. 18     : L_OT = Σ_l softmax(w)_l · OT(l)    (learnable layer weights)
+Eq. 19-20  : L = L_LM + λ · L_OT   (causal LM on target branch only)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Usage (same CLI as original)
+GPU OPTIMISATIONS (compatible with correct paper formulation)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[OPT-1] BATCHED SINKHORN — fully vectorised over batch dimension
+[OPT-2] output_attentions=True ONLY for target branch (needed for eq.13)
+        Dominant/EN branch uses output_attentions=False + uniform fallback
+        to avoid doubling memory; OR set --real_attn_en to use real attn.
+[OPT-3] SINGLE FORWARD PASS per branch (no redundant calls)
+[OPT-4] torch.cdist / torch.bmm for cost matrix — no Python loops
+[OPT-5] torch.compile on Sinkhorn kernel (PyTorch ≥ 2.0, opt-in)
+[OPT-6] GRADIENT ACCUMULATION with proper 1/grad_accum scaling
+[OPT-7] FROZEN BRANCH under torch.inference_mode() + no_grad
+[OPT-8] DataLoader persistent_workers + prefetch_factor
+[OPT-9] FUSED ADAMW
+[OPT-10] Loss computed in float32; backward in bf16 (autocast)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Usage
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
     python Llama3-8B-OT-optimized.py \\
@@ -76,6 +50,7 @@ Usage (same CLI as original)
         --sinkhorn_eps  0.1 \\
         --opus_ratio    0.05 \\
         --eng_eng_ratio 0.30 \\
+        --seq_length    512 \\
         --save_iter     200
 """
 
@@ -87,7 +62,6 @@ import math
 import os
 import shutil
 import time
-from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -106,6 +80,8 @@ from peft import LoraConfig, get_peft_model, PeftModel
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import numpy as np
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "dataloader"))
@@ -142,7 +118,7 @@ LOSS_LOG_FILE        = "ot_loss_log.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Llama-3-8B OT Alignment — Optimised")
+    p = argparse.ArgumentParser(description="Llama-3-8B OT Alignment — Paper-correct")
 
     p.add_argument("--base_model",      type=str, default="ducanhdinh/Llama3-8B-Finetune")
     p.add_argument("--data_root",       type=str, default="../raw_data/alignment/")
@@ -152,9 +128,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--epochs",          type=int,   default=3)
     p.add_argument("--batch_size",      type=int,   default=8)
-    # [OPT-6] gradient accumulation — effective_batch = batch_size * grad_accum
-    p.add_argument("--grad_accum",      type=int,   default=4,
-                   help="Gradient accumulation steps (effective_batch = batch_size × grad_accum)")
+    p.add_argument("--grad_accum",      type=int,   default=4)
     p.add_argument("--lr",              type=float, default=2e-5)
     p.add_argument("--warmup_ratio",    type=float, default=0.03)
     p.add_argument("--weight_decay",    type=float, default=0.01)
@@ -168,7 +142,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument(
         "--middle_layers", type=str, default="auto",
-        help="'auto' → layers[8..23]. Or comma list: '8,12,16,20'",
+        help="'auto' → layers[N/4 .. 3N/4). Or comma list: '8,12,16,20'",
     )
 
     # LoRA config
@@ -179,18 +153,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--opus_ratio",      type=float, default=0.05)
     p.add_argument("--eng_eng_ratio",   type=float, default=0.0)
 
-    p.add_argument("--save_iter",       type=int, default=0)
-    p.add_argument("--max_length",      type=int, default=256)
-    p.add_argument("--num_workers",     type=int, default=4)
+    p.add_argument("--save_iter",       type=int,   default=0)
+
+    # Sequence length
+    p.add_argument("--seq_length",      type=int,   default=None)
+    p.add_argument("--max_length",      type=int,   default=256)
+
+    p.add_argument("--num_workers",     type=int,   default=4)
     p.add_argument("--bf16",            action="store_true", default=True)
     p.add_argument("--fp16",            action="store_true")
-    p.add_argument("--oom_skip_batches",type=int, default=3)
+    p.add_argument("--oom_skip_batches",type=int,   default=3)
     p.add_argument("--gradient_checkpointing", action="store_true", default=True)
     p.add_argument("--no_gradient_checkpointing",
                    dest="gradient_checkpointing", action="store_false")
-    # [OPT-5] torch.compile
-    p.add_argument("--compile",         action="store_true", default=False,
-                   help="torch.compile the Sinkhorn kernel (PyTorch ≥ 2.0)")
+    p.add_argument("--compile",         action="store_true", default=False)
+
+    # Whether to use real attention weights for the frozen EN branch too.
+    # Costs extra memory but is more faithful to eq.13 for both branches.
+    p.add_argument("--real_attn_en",    action="store_true", default=False,
+                   help="Use real attention weights for EN branch (more memory).")
+
+    p.add_argument("--plot_smooth",     type=int,   default=20)
 
     return p.parse_args()
 
@@ -200,7 +183,7 @@ def parse_args() -> argparse.Namespace:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def set_seed(seed: int) -> None:
-    import random, numpy as np
+    import random
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -214,11 +197,11 @@ def set_seed(seed: int) -> None:
 
 def resolve_middle_layers(spec: str, n_total: int = 32) -> List[int]:
     if spec == "auto":
-        start = n_total // 4
-        end   = n_total * 3 // 4
+        start  = n_total // 4
+        end    = (n_total * 3) // 4
         layers = list(range(start, end))
     elif ":" in spec:
-        a, b = spec.split(":")
+        a, b   = spec.split(":")
         layers = list(range(int(a), int(b)))
     else:
         layers = [int(x.strip()) for x in spec.split(",") if x.strip()]
@@ -227,147 +210,97 @@ def resolve_middle_layers(spec: str, n_total: int = 32) -> List[int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [OPT-1, OPT-5] BATCHED Log-domain Sinkhorn
+# [OPT-1, OPT-5]  Log-domain Sinkhorn — batched, GPU-vectorised
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sinkhorn_log_batched_inner(
-    C: torch.Tensor,          # [B, m, n]  cost matrices (float32)
+    C: torch.Tensor,          # [B, m, n]  float32
     eps: float,
     max_iter: int,
 ) -> torch.Tensor:
-    """
-    Fully vectorised Sinkhorn for a batch of cost matrices.
-
-    All B optimal transport problems are solved simultaneously as a single
-    GPU tensor operation — no Python for-loop over batch dimension.
-
-    Parameters
-    ----------
-    C        : [B, m, n]  cost matrices in float32 (cosine distance ∈ [0, 2])
-    eps      : entropy regularisation ε
-    max_iter : Sinkhorn–Knopp iterations
-
-    Returns
-    -------
-    T : [B, m, n]  batch of transport plans
-    """
     B, m, n = C.shape
     device  = C.device
-    dtype   = C.dtype                          # float32 always
+    dtype   = C.dtype
 
-    # Uniform marginals
-    log_a = torch.full((B, m), -math.log(m), dtype=dtype, device=device)  # [B, m]
-    log_b = torch.full((B, n), -math.log(n), dtype=dtype, device=device)  # [B, n]
+    log_a = torch.full((B, m), -math.log(m), dtype=dtype, device=device)
+    log_b = torch.full((B, n), -math.log(n), dtype=dtype, device=device)
 
     f = torch.zeros(B, m, dtype=dtype, device=device)
     g = torch.zeros(B, n, dtype=dtype, device=device)
 
     for _ in range(max_iter):
-        # f update: [B, m] = eps * log_a - eps * logsumexp_n((g - C) / eps)
-        # g[..., None, :] - C  → [B, m, n];  logsumexp over dim=-1 → [B, m]
-        log_sum_f = torch.logsumexp((g.unsqueeze(1) - C) / eps, dim=-1)   # [B, m]
+        log_sum_f = torch.logsumexp((g.unsqueeze(1) - C) / eps, dim=2)  # [B, m]
         f = eps * log_a - eps * log_sum_f
 
-        # g update: [B, n] = eps * log_b - eps * logsumexp_m((f - C^T) / eps)
-        # f[..., :, None] - C  → [B, m, n];  logsumexp over dim=-2 → [B, n]
-        log_sum_g = torch.logsumexp((f.unsqueeze(2) - C) / eps, dim=-2)   # [B, n]
+        log_sum_g = torch.logsumexp((f.unsqueeze(2) - C) / eps, dim=1)  # [B, n]
         g = eps * log_b - eps * log_sum_g
 
-    # T_ij = exp((f_i + g_j - C_ij) / eps)  → [B, m, n]
-    log_T = (f.unsqueeze(2) + g.unsqueeze(1) - C) / eps
+    log_T = (f.unsqueeze(2) + g.unsqueeze(1) - C) / eps  # [B, m, n]
     return torch.exp(log_T)
 
 
-def sinkhorn_log_batched(
-    C: torch.Tensor,          # [B, m, n]
-    eps: float,
-    max_iter: int,
-) -> torch.Tensor:
-    """Public entry point — always float32 for Sinkhorn stability."""
+def sinkhorn_log_batched(C: torch.Tensor, eps: float, max_iter: int) -> torch.Tensor:
     return _sinkhorn_log_batched_inner(C.float(), eps, max_iter)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [OPT-2] Mask-mean pooling (replaces attention-weighted pooling)
+# Attention-Weighted Pooling  —  eqs. (13)–(14)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def masked_mean_pool(
-    hidden: torch.Tensor,          # [B, s, d]
-    attention_mask: torch.Tensor,  # [B, s]
+def attention_weighted_pool_from_attn(
+    hidden: torch.Tensor,           # [B, s, d]
+    attn_weights: torch.Tensor,     # [B, H, s, s]
+    attention_mask: torch.Tensor,   # [B, s]
 ) -> torch.Tensor:
-    """
-    Returns H̃ ∈ R^{B×s×d} where each token representation is
-    uniformly weighted (no attention materialisation needed).
-
-    mask_expanded [B, s, 1] broadcasts over d-dim.
-    Result is L2-normalised per token to unit sphere (eq. 14).
-    """
-    mask = attention_mask.float().unsqueeze(-1)   # [B, s, 1]
-    pooled = hidden * mask                        # [B, s, d]  — zero pad tokens
-    return F.normalize(pooled, p=2, dim=-1)       # [B, s, d]  — unit sphere rows
+    alpha = attn_weights.float().mean(dim=1).mean(dim=1)   # [B, s]
+    alpha = alpha * attention_mask.float()
+    alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-12)
+    h_tilde = hidden * alpha.unsqueeze(-1)                  # [B, s, d]
+    h_norm  = F.normalize(h_tilde, p=2, dim=-1)
+    return h_norm
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# [OPT-1+4] Batched OT loss across ALL layers at once
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_ot_loss_batched(
-    pooled_tgt:  torch.Tensor,     # [B, s_tgt, d]  unit-sphere, already masked
-    pooled_en:   torch.Tensor,     # [B, s_en,  d]
-    tgt_mask:    torch.Tensor,     # [B, s_tgt]
-    en_mask:     torch.Tensor,     # [B, s_en]
-    eps:         float,
-    max_iter:    int,
+def attention_weighted_pool_uniform(
+    hidden: torch.Tensor,           # [B, s, d]
+    attention_mask: torch.Tensor,   # [B, s]
 ) -> torch.Tensor:
-    """
-    Compute OT loss for a full batch in a single vectorised call.
+    mask   = attention_mask.float()
+    n_real = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+    alpha  = mask / n_real
+    h_tilde = hidden * alpha.unsqueeze(-1)
+    h_norm  = F.normalize(h_tilde, p=2, dim=-1)
+    return h_norm
 
-    Key differences from original per-sample loop
-    ---------------------------------------------
-    Original: for b in range(B):
-                  h_t = pooled_tgt[b, :tgt_len[b]]
-                  h_e = pooled_en[b,  :en_len[b]]
-                  C   = 1 - mm(h_t, h_e.T)        # [s_t, s_e]
-                  T   = sinkhorn_log(...)           # serial
-                  loss += (C * T).sum()
 
-    Optimised: C = 1 - bmm(H_tgt, H_en.T)         # [B, s_tgt, s_en] — one bmm call
-               T = sinkhorn_log_batched(C)         # [B, s_tgt, s_en] — fully parallel
-               loss = (C * T * valid_mask).sum() / B
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-layer OT Loss  —  eqs. (16)–(17)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Padding handling: pad-token rows/cols in C are multiplied by a validity
-    mask derived from tgt_mask ⊗ en_mask so they contribute 0 to the loss.
-
-    Returns
-    -------
-    Scalar OT loss (float32 for backward stability)
-    """
-    # Cost matrix: C_ij = 1 - cosine(tgt_i, en_j) — [B, s_tgt, s_en]
-    # pooled tensors already unit-sphere, so bmm gives cosine similarity
-    # [OPT-4] single fused bmm call for all B pairs
+def compute_ot_loss_single_layer(
+    h_tgt: torch.Tensor,
+    h_en:  torch.Tensor,
+    tgt_mask: torch.Tensor,
+    en_mask:  torch.Tensor,
+    eps:      float,
+    max_iter: int,
+) -> torch.Tensor:
     C = 1.0 - torch.bmm(
-        pooled_tgt.float(),                       # [B, s_tgt, d]
-        pooled_en.float().transpose(1, 2),        # [B, d, s_en]
-    )                                             # → [B, s_tgt, s_en]
+        h_tgt.float(),
+        h_en.float().transpose(1, 2),
+    )
     C = C.clamp(0.0, 2.0)
 
-    # Validity mask: 1 where both tgt token i and en token j are real (not pad)
-    # [B, s_tgt, 1] * [B, 1, s_en] → [B, s_tgt, s_en]
     valid = tgt_mask.float().unsqueeze(2) * en_mask.float().unsqueeze(1)
+    C_masked = C * valid + (1.0 - valid) * 2.0
 
-    # Mask out pad entries in C so Sinkhorn treats them as far-away
-    C = C * valid + (1.0 - valid) * 2.0          # pad → max cost (won't be transported)
+    T = sinkhorn_log_batched(C_masked, eps=eps, max_iter=max_iter)
 
-    # [OPT-1] Batched Sinkhorn — all B problems solved in parallel
-    T = sinkhorn_log_batched(C, eps=eps, max_iter=max_iter)  # [B, s_tgt, s_en]
-
-    # OT loss = <C, T>_F averaged over batch, ignoring pad contributions
-    ot = (C * T * valid).sum() / (valid.sum() + 1e-8)        # scalar
-    return ot
+    ot_per_sample = (C * T * valid).sum(dim=(1, 2))
+    return ot_per_sample.mean()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LayerWeights module (unchanged — eq. 18)
+# LayerWeights  —  eq. (18)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LayerWeights(nn.Module):
@@ -382,166 +315,192 @@ class LayerWeights(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# L_LM (unchanged — eq. 20)
+# L_LM  —  eq. (20)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
-    loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="mean")
-    return loss_fct(
+    return nn.CrossEntropyLoss(ignore_index=-100)(
         shift_logits.view(-1, shift_logits.size(-1)),
         shift_labels.view(-1),
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [OPT-3, OPT-7] Dual forward pass — tgt (LoRA on) + en (frozen, inference_mode)
+# Forward passes
 # ─────────────────────────────────────────────────────────────────────────────
 
-def forward_tgt(
+def forward_target_branch(
     model,
-    input_ids: torch.Tensor,
+    input_ids:      torch.Tensor,
     attention_mask: torch.Tensor,
-    middle_layers: List[int],
-    amp_dtype,
-    use_amp: bool,
-    device: torch.device,
-) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+    middle_layers:  List[int],
+    amp_dtype:      torch.dtype,
+    use_amp:        bool,
+    device:         torch.device,
+) -> Tuple[torch.Tensor, Dict[int, Tuple[torch.Tensor, torch.Tensor]]]:
     """
-    Target branch: LoRA adapters ACTIVE, gradients ENABLED.
-    Returns (logits, {layer: hidden [B,s,d]}).
+    Target (LoRA) branch — eq. (11).
+    Returns:
+      logits:     [B, s, V]   for L_LM (eq. 20)
+      layer_data: dict  layer_idx → (hidden [B,s,d], attn [B,H,s,s])
 
-    [OPT-2] output_attentions=False — eliminates O(B·H·s²·L) attention tensor
-    allocation. Hidden states only, then mask-mean pooled.
+    FIX: Model must be loaded with attn_implementation='eager' so that
+         output_attentions=True actually populates out.attentions.
+         With 'sdpa' (PyTorch default), out.attentions is an empty tuple
+         and out.attentions[l] raises IndexError.
     """
     with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
         out = model(
             input_ids=input_ids.to(device),
             attention_mask=attention_mask.to(device),
             output_hidden_states=True,
-            output_attentions=False,        # [OPT-2] no attention materialisation
+            output_attentions=True,
             use_cache=False,
         )
 
-    # hidden_states[0] = embedding layer; hidden_states[l+1] = transformer layer l
-    layer_hidden = {
-        l: out.hidden_states[l + 1]         # [B, s, d]
-        for l in middle_layers
-    }
-    return out.logits, layer_hidden
+    # Validate attentions were actually returned
+    # ── BUG FIX ──────────────────────────────────────────────────────────────
+    # With sdpa backend, out.attentions may be None or an empty tuple even
+    # when output_attentions=True is requested.  Guard and fall back to uniform
+    # pooling in that case so training does not crash.
+    has_attentions = (
+        out.attentions is not None
+        and len(out.attentions) > 0
+    )
+    if not has_attentions:
+        logger.warning(
+            "[forward_target_branch] out.attentions is empty — "
+            "the model was likely loaded without attn_implementation='eager'. "
+            "Falling back to uniform attention pooling for this batch."
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
+    layer_data: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+    for l in middle_layers:
+        hidden = out.hidden_states[l + 1]          # [B, s, d]
+        # out.attentions is indexed 0..N_layers-1 (one entry per layer)
+        attn = out.attentions[l] if has_attentions else None   # [B, H, s, s] or None
+        layer_data[l] = (hidden, attn)
+
+    return out.logits, layer_data
 
 
-@torch.inference_mode()                     # [OPT-7] faster than no_grad
-def forward_en(
+@torch.inference_mode()
+def forward_dominant_branch(
     model,
-    input_ids: torch.Tensor,
+    input_ids:      torch.Tensor,
     attention_mask: torch.Tensor,
-    middle_layers: List[int],
-    amp_dtype,
-    use_amp: bool,
-    device: torch.device,
-) -> Dict[int, torch.Tensor]:
+    middle_layers:  List[int],
+    real_attn_en:   bool,
+    amp_dtype:      torch.dtype,
+    use_amp:        bool,
+    device:         torch.device,
+) -> Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
     """
-    English (frozen) branch: LoRA adapters DISABLED via model context manager.
-    Uses torch.inference_mode() — no autograd overhead at all.
-
-    [OPT-3] We use model.disable_adapter_layers() ONCE before the batch loop
-    (see compute_total_loss) and re-enable ONCE after. Here we just call forward.
-    This avoids the per-batch Python overhead of toggle calls inside the step fn.
+    Dominant (frozen EN) branch — eq. (12).
     """
-    with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-        out = model(
-            input_ids=input_ids.to(device),
-            attention_mask=attention_mask.to(device),
-            output_hidden_states=True,
-            output_attentions=False,        # [OPT-2]
-            use_cache=False,
-        )
+    model.disable_adapter_layers()
+    try:
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+            out = model(
+                input_ids=input_ids.to(device),
+                attention_mask=attention_mask.to(device),
+                output_hidden_states=True,
+                output_attentions=real_attn_en,
+                use_cache=False,
+            )
+    finally:
+        model.enable_adapter_layers()
 
-    return {
-        l: out.hidden_states[l + 1]
-        for l in middle_layers
-    }
+    # ── BUG FIX ──────────────────────────────────────────────────────────────
+    # Same guard as in forward_target_branch: sdpa may return empty attentions.
+    has_attentions = (
+        real_attn_en
+        and out.attentions is not None
+        and len(out.attentions) > 0
+    )
+    # ─────────────────────────────────────────────────────────────────────────
+
+    layer_data: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+    for l in middle_layers:
+        hidden = out.hidden_states[l + 1]
+        attn   = out.attentions[l] if has_attentions else None
+        layer_data[l] = (hidden, attn)
+
+    return layer_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [OPT-1,2,3,4] Full loss computation — vectorised, no per-sample Python loops
+# Full loss  —  eq. (19):  L = L_LM + λ · L_OT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_total_loss(
     model,
-    batch: Dict,
-    middle_layers: List[int],
-    layer_weights_module: LayerWeights,
-    lambda_ot: float,
-    sinkhorn_eps: float,
-    sinkhorn_iters: int,
-    amp_dtype,
-    use_amp: bool,
-    device: torch.device,
+    batch:                  dict,
+    middle_layers:          List[int],
+    layer_weights_module:   LayerWeights,
+    lambda_ot:              float,
+    sinkhorn_eps:           float,
+    sinkhorn_iters:         int,
+    real_attn_en:           bool,
+    amp_dtype:              torch.dtype,
+    use_amp:                bool,
+    device:                 torch.device,
 ) -> Tuple[torch.Tensor, float, float]:
-    """
-    Compute L = L_LM + λ·L_OT for one batch.
-
-    Execution order
-    ---------------
-    1. tgt forward (LoRA on, gradients)
-    2. en  forward (LoRA off via context manager, inference_mode)
-    3. Per-layer: mask-mean pool → batched OT loss  [all vectorised]
-    4. Aggregate L_OT with LayerWeights (eq. 18)
-    5. L = L_LM + λ·L_OT
-
-    No Python for-loops over batch samples. All B samples processed in parallel.
-    """
     tgt_ids  = batch["tgt_input_ids"].to(device, non_blocking=True)
     tgt_mask = batch["tgt_attention_mask"].to(device, non_blocking=True)
     tgt_lbl  = batch["tgt_labels"].to(device, non_blocking=True)
     en_ids   = batch["en_input_ids"].to(device, non_blocking=True)
     en_mask  = batch["en_attention_mask"].to(device, non_blocking=True)
 
-    # ── 1. Target branch (LoRA active) ───────────────────────────────────────
-    logits, tgt_hidden = forward_tgt(
-        model, tgt_ids, tgt_mask, middle_layers,
-        amp_dtype, use_amp, device,
+    # ── TARGET branch (eq. 11) ──────────────────────────────────────────────
+    logits, tgt_layer_data = forward_target_branch(
+        model, tgt_ids, tgt_mask, middle_layers, amp_dtype, use_amp, device,
     )
 
-    # L_LM — eq. 20
     with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
         loss_lm = compute_lm_loss(logits, tgt_lbl)
 
-    # ── 2. English branch (LoRA disabled, inference_mode) ────────────────────
-    # [OPT-3] Single toggle pair per batch, not nested inside layer loop
-    model.disable_adapter_layers()
-    en_hidden = forward_en(
-        model, en_ids, en_mask, middle_layers,
-        amp_dtype, use_amp, device,
+    # ── DOMINANT branch (eq. 12) ─────────────────────────────────────────────
+    en_layer_data = forward_dominant_branch(
+        model, en_ids, en_mask, middle_layers, real_attn_en, amp_dtype, use_amp, device,
     )
-    model.enable_adapter_layers()
 
-    # ── 3. Per-layer OT loss (fully vectorised — [OPT-1,2,4]) ────────────────
-    ot_losses_per_layer: List[torch.Tensor] = []
+    # ── Per-layer OT losses (eqs. 13–17) ─────────────────────────────────────
+    ot_losses: List[torch.Tensor] = []
 
     for l in middle_layers:
-        # [OPT-2] mask-mean pool (no attention tensors)
-        pooled_tgt = masked_mean_pool(tgt_hidden[l], tgt_mask)  # [B, s_tgt, d]
-        pooled_en  = masked_mean_pool(en_hidden[l],  en_mask)   # [B, s_en,  d]
+        tgt_hidden, tgt_attn = tgt_layer_data[l]
+        en_hidden,  en_attn  = en_layer_data[l]
 
-        # [OPT-1,4] batched OT — single bmm + batched sinkhorn, no Python loop
-        ot_l = compute_ot_loss_batched(
-            pooled_tgt, pooled_en,
-            tgt_mask, en_mask,
+        # Eqs. 13–14: attention-weighted pooling + L2 normalisation
+        # TARGET branch: use real attn if available, else uniform fallback
+        if tgt_attn is not None:
+            h_tgt = attention_weighted_pool_from_attn(tgt_hidden, tgt_attn, tgt_mask)
+        else:
+            h_tgt = attention_weighted_pool_uniform(tgt_hidden, tgt_mask)
+
+        # DOMINANT branch: real attn if available, else uniform fallback
+        if en_attn is not None:
+            h_en = attention_weighted_pool_from_attn(en_hidden, en_attn, en_mask)
+        else:
+            h_en = attention_weighted_pool_uniform(en_hidden, en_mask)
+
+        ot_l = compute_ot_loss_single_layer(
+            h_tgt, h_en, tgt_mask, en_mask,
             eps=sinkhorn_eps, max_iter=sinkhorn_iters,
         )
-        ot_losses_per_layer.append(ot_l)
+        ot_losses.append(ot_l)
 
-    # ── 4. Aggregate (eq. 18) ─────────────────────────────────────────────────
-    if ot_losses_per_layer:
-        loss_ot = layer_weights_module(ot_losses_per_layer)
+    # Eq. 18
+    if ot_losses:
+        loss_ot = layer_weights_module(ot_losses)
     else:
         loss_ot = torch.tensor(0.0, device=device)
 
-    # ── 5. Total loss (eq. 19) ────────────────────────────────────────────────
+    # Eq. 19
     loss = loss_lm + lambda_ot * loss_ot
 
     return loss, loss_lm.item(), loss_ot.item()
@@ -552,9 +511,9 @@ def compute_total_loss(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _is_oom(e: Exception) -> bool:
-    if isinstance(e, torch.cuda.OutOfMemoryError):
-        return True
-    return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+    return isinstance(e, torch.cuda.OutOfMemoryError) or (
+        isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+    )
 
 
 def _cleanup_oom(optimizer, *tensors):
@@ -567,7 +526,315 @@ def _cleanup_oom(optimizer, *tensors):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HF Hub helpers (unchanged from original)
+# Loss plotting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rolling_mean(values: List[float], window: int) -> List[float]:
+    if window <= 1 or len(values) < 2:
+        return values
+    arr     = np.array(values, dtype=np.float64)
+    kernel  = np.ones(window) / window
+    padded  = np.concatenate([arr[:window - 1], arr])
+    return np.convolve(padded, kernel, mode="valid").tolist()
+
+
+def plot_training_loss(loss_log: List[Dict], output_dir: Path, smooth: int = 20) -> None:
+    if not loss_log:
+        return
+
+    steps      = [e["step"]      for e in loss_log]
+    total_loss = [e["loss"]      for e in loss_log]
+    lm_loss    = [e["lm_loss"]   for e in loss_log]
+    lam_ot     = [e["lambda_ot"] for e in loss_log]
+    ot_raw     = [e["ot_loss"]   for e in loss_log]
+
+    panels = [
+        ((0, 0), total_loss, "Total Loss  L = L_LM + λ·L_OT", "loss",   "#2f7fc1"),
+        ((0, 1), lm_loss,   "L_LM  (causal LM, eq.20)",        "loss",   "#e07b39"),
+        ((1, 0), lam_ot,    "λ·L_OT  (weighted OT, eq.18-19)", "λ·loss", "#3aaa6b"),
+        ((1, 1), ot_raw,    "L_OT raw  (eq.18 before λ)",      "loss",   "#9b59b6"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+    fig.suptitle(
+        f"OT Alignment — Training Progress  (step {steps[-1]})",
+        fontsize=14, fontweight="bold", y=1.01,
+    )
+
+    for (r, c), vals, title, ylabel, colour in panels:
+        ax = axes[r][c]
+        ax.plot(steps, vals, color=colour, alpha=0.20, linewidth=0.7, label="raw")
+        smoothed = _rolling_mean(vals, smooth)
+        ax.plot(steps, smoothed, color=colour, linewidth=1.8, label=f"smooth (w={smooth})")
+        ax.scatter([steps[-1]], [smoothed[-1]], color=colour, s=30, zorder=5)
+        ax.annotate(
+            f"{smoothed[-1]:.4f}",
+            xy=(steps[-1], smoothed[-1]), xytext=(5, 4),
+            textcoords="offset points", fontsize=7, color=colour,
+        )
+        ax.set_title(title, fontsize=10, fontweight="semibold")
+        ax.set_xlabel("Optimizer step", fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.3, linewidth=0.5)
+        ax.legend(fontsize=7, loc="upper right")
+
+        prev_ep = None
+        for entry in loss_log:
+            ep = entry.get("epoch")
+            if ep != prev_ep and prev_ep is not None:
+                ax.axvline(x=entry["step"], color="gray",
+                           linestyle="--", linewidth=0.7, alpha=0.5)
+            prev_ep = ep
+
+    plt.tight_layout()
+    out_path = output_dir / "ot_training_loss.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"[Plot] ✓ Loss chart → {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OT Transport Diagnostic
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sinkhorn_numpy(C: np.ndarray, eps: float, n_iter: int = 100) -> np.ndarray:
+    m, n   = C.shape
+    log_a  = np.full(m, -np.log(m))
+    log_b  = np.full(n, -np.log(n))
+    f, g   = np.zeros(m), np.zeros(n)
+    for _ in range(n_iter):
+        f = eps * log_a - eps * np.logaddexp.reduce((g[None, :] - C) / eps, axis=1)
+        g = eps * log_b - eps * np.logaddexp.reduce((f[:, None] - C) / eps, axis=0)
+    return np.exp((f[:, None] + g[None, :] - C) / eps)
+
+
+def _decode_tokens(tokenizer, ids: torch.Tensor) -> List[str]:
+    out = []
+    for id_ in ids.tolist():
+        tok = tokenizer.decode([id_], skip_special_tokens=False,
+                               clean_up_tokenization_spaces=False).strip()
+        if not tok:
+            tok = f"[{id_}]"
+        # No truncation — show full token text
+        out.append(tok)
+    return out
+
+
+@torch.no_grad()
+def plot_ot_transport_diagnostic(
+    model,
+    tokenizer,
+    batch:                Dict[str, torch.Tensor],
+    middle_layers:        List[int],
+    layer_weights_module: LayerWeights,
+    sinkhorn_eps:         float,
+    global_step:          int,
+    epoch:                int,
+    output_dir:           Path,
+    real_attn_en:         bool,
+    amp_dtype:            torch.dtype,
+    use_amp:              bool,
+    device:               torch.device,
+    sample_idx:           int = 0,
+) -> Path:
+    model.eval()
+
+    tgt_ids  = batch["tgt_input_ids"]
+    tgt_mask = batch["tgt_attention_mask"]
+    en_ids   = batch["en_input_ids"]
+    en_mask  = batch["en_attention_mask"]
+
+    _, tgt_layer_data = forward_target_branch(
+        model, tgt_ids, tgt_mask, middle_layers, amp_dtype, use_amp, device,
+    )
+    en_layer_data = forward_dominant_branch(
+        model, en_ids, en_mask, middle_layers, real_attn_en, amp_dtype, use_amp, device,
+    )
+
+    tgt_pooled: Dict[int, np.ndarray] = {}
+    en_pooled:  Dict[int, np.ndarray] = {}
+
+    for l in middle_layers:
+        tgt_h, tgt_a = tgt_layer_data[l]
+        en_h,  en_a  = en_layer_data[l]
+
+        if tgt_a is not None:
+            h_t = attention_weighted_pool_from_attn(
+                tgt_h, tgt_a, tgt_mask.to(device),
+            )[sample_idx].float().cpu().numpy()
+        else:
+            h_t = attention_weighted_pool_uniform(
+                tgt_h, tgt_mask.to(device),
+            )[sample_idx].float().cpu().numpy()
+
+        if en_a is not None:
+            h_e = attention_weighted_pool_from_attn(
+                en_h, en_a, en_mask.to(device),
+            )[sample_idx].float().cpu().numpy()
+        else:
+            h_e = attention_weighted_pool_uniform(
+                en_h, en_mask.to(device),
+            )[sample_idx].float().cpu().numpy()
+
+        tgt_pooled[l] = h_t
+        en_pooled[l]  = h_e
+
+    layer_w = F.softmax(layer_weights_module.w.detach().float(), dim=0).cpu().numpy()
+
+    h_tgt_agg = sum(layer_w[li] * tgt_pooled[l]
+                    for li, l in enumerate(middle_layers))
+    h_en_agg  = sum(layer_w[li] * en_pooled[l]
+                    for li, l in enumerate(middle_layers))
+
+    h_tgt_agg /= np.linalg.norm(h_tgt_agg, axis=1, keepdims=True) + 1e-12
+    h_en_agg  /= np.linalg.norm(h_en_agg,  axis=1, keepdims=True) + 1e-12
+
+    tgt_real = int(tgt_mask[sample_idx].sum().item())
+    en_real  = int(en_mask[sample_idx].sum().item())
+
+    h_tv = h_tgt_agg[:tgt_real]
+    h_ev = h_en_agg[:en_real]
+    C_agg   = np.clip(1.0 - np.clip(h_tv @ h_ev.T, -1.0, 1.0), 0.0, 2.0)
+    T_agg   = _sinkhorn_numpy(C_agg, eps=sinkhorn_eps)
+    ot_agg_scalar = float(np.sum(C_agg * T_agg))
+
+    per_layer_ot: List[float] = []
+    for l in middle_layers:
+        h_t = tgt_pooled[l][:tgt_real]
+        h_e = en_pooled[l][:en_real]
+        h_t /= np.linalg.norm(h_t, axis=1, keepdims=True) + 1e-12
+        h_e /= np.linalg.norm(h_e, axis=1, keepdims=True) + 1e-12
+        C_l = np.clip(1.0 - np.clip(h_t @ h_e.T, -1.0, 1.0), 0.0, 2.0)
+        T_l = _sinkhorn_numpy(C_l, eps=sinkhorn_eps)
+        per_layer_ot.append(float(np.sum(C_l * T_l)))
+
+    labels_tgt = _decode_tokens(tokenizer, tgt_ids[sample_idx][:tgt_real])
+    labels_en  = _decode_tokens(tokenizer, en_ids[sample_idx][:en_real])
+
+    # ── White / light theme ───────────────────────────────────────────────
+    _BG       = "white"
+    _PANEL_BG = "#f8f9fa"
+    _TEXT     = "#1a1a1a"
+    _GRID     = "#cccccc"
+    _SPINE    = "#999999"
+
+    # ── Dynamic figure size — scale with number of tokens ────────────────
+    n_tgt = len(labels_tgt)
+    n_en  = len(labels_en)
+    # Map panel: needs enough pixels per token for readability
+    map_w  = max(10, n_tgt * 0.55)   # ~0.55 inch per target token
+    map_h  = max(8,  n_en  * 0.45)   # ~0.45 inch per EN token
+    fig_w  = map_w + 8                # right panels ~8 inch wide
+    fig_h  = max(map_h, 10)
+
+    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=_BG)
+    gs  = gridspec.GridSpec(2, 2, figure=fig,
+                            width_ratios=[map_w, 7], height_ratios=[1, 1],
+                            hspace=0.50, wspace=0.35)
+    ax_map   = fig.add_subplot(gs[:, 0])
+    ax_layer = fig.add_subplot(gs[0, 1])
+    ax_bar   = fig.add_subplot(gs[1, 1])
+
+    for ax in [ax_map, ax_layer, ax_bar]:
+        ax.set_facecolor(_PANEL_BG)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(_SPINE)
+        ax.tick_params(colors=_TEXT, labelsize=7)
+        ax.xaxis.label.set_color(_TEXT)
+        ax.yaxis.label.set_color(_TEXT)
+        ax.title.set_color(_TEXT)
+
+    # ── Panel A: Transport Map ────────────────────────────────────────────
+    T_display = T_agg.T   # [n_en, n_tgt]
+
+    # Font size: scale down for many tokens, floor at 5
+    TICK_x = max(5, min(9, int(160 / max(n_tgt, 1))))
+    TICK_y = max(5, min(9, int(160 / max(n_en,  1))))
+
+    im = ax_map.imshow(T_display, cmap="YlOrRd", aspect="auto",
+                       interpolation="nearest",
+                       vmin=T_display.min(), vmax=T_display.max())
+    ax_map.set_xticks(range(n_tgt))
+    ax_map.set_xticklabels(labels_tgt, rotation=60, ha="right",
+                            fontsize=TICK_x, color=_TEXT)
+    ax_map.set_yticks(range(n_en))
+    ax_map.set_yticklabels(labels_en, fontsize=TICK_y, color=_TEXT)
+    ax_map.set_xlabel("Target tokens (post-LoRA, eq.11)", fontsize=9, color=_TEXT)
+    ax_map.set_ylabel("Dominant EN tokens (frozen, eq.12)", fontsize=9, color=_TEXT)
+    ax_map.set_title(
+        f"Aggregated OT Transport Map  (step {global_step}, epoch {epoch})\n"
+        f"OT = {ot_agg_scalar:.5f}   ε={sinkhorn_eps}   |L|={len(middle_layers)}",
+        fontsize=9, fontweight="bold", color=_TEXT, pad=8,
+    )
+    cbar = fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
+    cbar.ax.tick_params(labelsize=7, colors=_TEXT)
+
+    # Show cell values only when the grid is small enough to be readable
+    if n_tgt <= 30 and n_en <= 30:
+        val_fs = max(4, min(7, int(120 / max(n_tgt, n_en))))
+        for ri in range(n_en):
+            for ci in range(n_tgt):
+                v = T_display[ri, ci]
+                cell_color = "#fff" if v > 0.6 * T_display.max() else "#333"
+                ax_map.text(ci, ri, f"{v:.3f}", ha="center", va="center",
+                            fontsize=val_fs, color=cell_color)
+
+    # ── Panel B: Layer Weights ────────────────────────────────────────────
+    layer_labels = [f"L{l}" for l in middle_layers]
+    im_w = ax_layer.imshow(layer_w.reshape(1, -1), cmap="viridis",
+                            aspect="auto", vmin=0, vmax=layer_w.max())
+    ax_layer.set_xticks(range(len(middle_layers)))
+    ax_layer.set_xticklabels(layer_labels, rotation=60, ha="right",
+                              fontsize=6, color=_TEXT)
+    ax_layer.set_yticks([])
+    ax_layer.set_title(f"softmax(w)  —  eq.18  —  step {global_step}",
+                        fontsize=9, fontweight="bold", color=_TEXT, pad=6)
+    for li, wv in enumerate(layer_w):
+        cell_color = "white" if wv > 0.6 * layer_w.max() else "#222"
+        ax_layer.text(li, 0, f"{wv:.3f}", ha="center", va="center",
+                      fontsize=5, color=cell_color)
+    cbar_w = fig.colorbar(im_w, ax=ax_layer, fraction=0.046, pad=0.04,
+                           orientation="horizontal")
+    cbar_w.ax.tick_params(labelsize=6, colors=_TEXT)
+
+    # ── Panel C: Per-layer OT scalar bar chart ────────────────────────────
+    bar_colours = plt.cm.viridis(np.linspace(0.15, 0.85, len(middle_layers)))
+    bars = ax_bar.bar(range(len(middle_layers)), per_layer_ot,
+                      color=bar_colours, edgecolor=_SPINE, linewidth=0.7)
+    for bar, wv in zip(bars, layer_w):
+        bar.set_alpha(0.55 + 0.45 * wv / (layer_w.max() + 1e-9))
+    ax_bar.set_xticks(range(len(middle_layers)))
+    ax_bar.set_xticklabels(layer_labels, rotation=60, ha="right",
+                            fontsize=6, color=_TEXT)
+    ax_bar.set_ylabel("OT(l) = ⟨C(l), T*(l)⟩_F  (eq.17)", fontsize=8, color=_TEXT)
+    ax_bar.set_title("Per-layer OT scalar  (eq.17)",
+                      fontsize=9, fontweight="bold", color=_TEXT, pad=6)
+    ax_bar.grid(axis="y", color=_GRID, linewidth=0.5, alpha=0.8)
+    for li, v in enumerate(per_layer_ot):
+        ax_bar.text(li, v + 0.0005 * max(per_layer_ot, default=1),
+                    f"{v:.4f}", ha="center", va="bottom",
+                    fontsize=5, color=_TEXT, rotation=60)
+
+    fig.suptitle(
+        "OT Diagnostic  —  Transport Map  ·  Layer Weights  ·  Per-layer Loss\n"
+        f"Step {global_step}  |  Epoch {epoch}  |  eqs. 13–18",
+        fontsize=11, fontweight="bold", color=_TEXT, y=1.01,
+    )
+    fig.patch.set_facecolor(_BG)
+
+    out_path = output_dir / f"ot_transport_step_{global_step:06d}.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight",
+                facecolor=_BG, pad_inches=0.2)
+    plt.close(fig)
+    logger.info(f"[VizOT] ✓ → {out_path}")
+
+    model.train()
+    return out_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HF Hub helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_repo(hub_repo: str) -> str:
@@ -621,14 +888,14 @@ def _upload_folder(hub_repo, local_dir, repo_subfolder, commit_msg):
 def load_training_state(hub_repo: str) -> Optional[Dict]:
     local = _download_hub_file(hub_repo, TRAINING_STATE_FILE)
     if local is None:
-        logger.info("[Resume] No state found — starting fresh.")
+        logger.info("[Resume] No state — starting fresh.")
         return None
     try:
         with open(local, "r", encoding="utf-8") as f:
             state = json.load(f)
         logger.info(
-            f"[Resume] Found state. completed={state.get('completed_epochs', [])}  "
-            f"global_step={state.get('global_step', 0)}"
+            f"[Resume] completed={state.get('completed_epochs', [])}  "
+            f"step={state.get('global_step', 0)}"
         )
         return state
     except Exception as e:
@@ -639,18 +906,22 @@ def load_training_state(hub_repo: str) -> Optional[Dict]:
 def load_optimizer_states(hub_repo, optimizer, scheduler, scaler,
                            layer_weights_module, device) -> List[Dict]:
     for fname, loader in [
-        (OPTIMIZER_STATE_FILE, lambda p: optimizer.load_state_dict(torch.load(p, map_location=device))),
-        (SCHEDULER_STATE_FILE, lambda p: scheduler.load_state_dict(torch.load(p, map_location="cpu"))),
-        (SCALER_STATE_FILE,    lambda p: scaler.load_state_dict(torch.load(p, map_location="cpu"))),
-        (LAYER_WEIGHTS_FILE,   lambda p: layer_weights_module.load_state_dict(torch.load(p, map_location=device))),
+        (OPTIMIZER_STATE_FILE, lambda p: optimizer.load_state_dict(
+            torch.load(p, map_location=device))),
+        (SCHEDULER_STATE_FILE, lambda p: scheduler.load_state_dict(
+            torch.load(p, map_location="cpu"))),
+        (SCALER_STATE_FILE,    lambda p: scaler.load_state_dict(
+            torch.load(p, map_location="cpu"))),
+        (LAYER_WEIGHTS_FILE,   lambda p: layer_weights_module.load_state_dict(
+            torch.load(p, map_location=device))),
     ]:
         path = _download_hub_file(hub_repo, fname)
         if path:
             try:
                 loader(path)
-                logger.info(f"[Resume] ✓ {fname} loaded.")
+                logger.info(f"[Resume] ✓ {fname}")
             except Exception as e:
-                logger.warning(f"[Resume] {fname} load error: {e}")
+                logger.warning(f"[Resume] {fname} error: {e}")
 
     ll_path = _download_hub_file(hub_repo, LOSS_LOG_FILE)
     if ll_path:
@@ -665,12 +936,14 @@ def load_optimizer_states(hub_repo, optimizer, scheduler, scaler,
 def save_and_push_checkpoint(
     hub_repo, output_dir, state, model, tokenizer,
     optimizer, scheduler, scaler, layer_weights_module,
-    loss_log, epoch, private, commit_suffix="", delete_local=True,
+    loss_log, epoch, private, smooth,
+    commit_suffix="", delete_local=True,
+    transport_plot_path: Optional[Path] = None,
 ):
     commit_base = f"epoch-{epoch}" + (f"-{commit_suffix}" if commit_suffix else "")
     _ensure_repo(hub_repo, private)
 
-    lora_dir   = output_dir / LORA_ADAPTER_DIR
+    lora_dir = output_dir / LORA_ADAPTER_DIR
     lora_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(lora_dir))
     tokenizer.save_pretrained(str(lora_dir))
@@ -681,23 +954,37 @@ def save_and_push_checkpoint(
     scl_path   = output_dir / SCALER_STATE_FILE
     lw_path    = output_dir / LAYER_WEIGHTS_FILE
     ll_path    = output_dir / LOSS_LOG_FILE
+    plot_path  = output_dir / "ot_training_loss.png"
 
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
     torch.save(optimizer.state_dict(), opt_path)
     torch.save(scheduler.state_dict(), sch_path)
-    torch.save(scaler.state_dict(), scl_path)
+    torch.save(scaler.state_dict(),    scl_path)
     torch.save(layer_weights_module.state_dict(), lw_path)
     with open(ll_path, "w", encoding="utf-8") as f:
         json.dump(loss_log, f)
 
+    plot_training_loss(loss_log, output_dir, smooth=smooth)
+
     _upload_folder(hub_repo, lora_dir, LORA_ADAPTER_DIR, f"lora {commit_base}")
-    for local_f, repo_f in [
-        (state_path, TRAINING_STATE_FILE), (opt_path, OPTIMIZER_STATE_FILE),
-        (sch_path, SCHEDULER_STATE_FILE),  (scl_path, SCALER_STATE_FILE),
-        (lw_path, LAYER_WEIGHTS_FILE),     (ll_path, LOSS_LOG_FILE),
-    ]:
-        _upload_file(hub_repo, local_f, repo_f, f"state {commit_base}")
+
+    files_to_upload = [
+        (state_path, TRAINING_STATE_FILE),
+        (opt_path,   OPTIMIZER_STATE_FILE),
+        (sch_path,   SCHEDULER_STATE_FILE),
+        (scl_path,   SCALER_STATE_FILE),
+        (lw_path,    LAYER_WEIGHTS_FILE),
+        (ll_path,    LOSS_LOG_FILE),
+        (plot_path,  "ot_training_loss.png"),
+    ]
+    if transport_plot_path is not None and transport_plot_path.exists():
+        files_to_upload.append(
+            (transport_plot_path, f"diagnostics/{transport_plot_path.name}")
+        )
+    for local_f, repo_f in files_to_upload:
+        if local_f.exists():
+            _upload_file(hub_repo, local_f, repo_f, f"state {commit_base}")
 
     logger.info(f"[Hub] ✓ Checkpoint pushed — {commit_base}")
 
@@ -717,11 +1004,15 @@ def load_lora_from_hub(hub_repo, base_model_name, dtype, device_map):
             return None
     except Exception:
         return None
-
+    # ── BUG FIX ──────────────────────────────────────────────────────────────
+    # attn_implementation="eager" is required so that output_attentions=True
+    # actually returns attention tensors.  The default "sdpa" backend silently
+    # returns an empty tuple, causing IndexError in forward_target_branch.
+    # ─────────────────────────────────────────────────────────────────────────
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name, torch_dtype=dtype, device_map=device_map,
         trust_remote_code=True,
-        output_attentions=False,   # [OPT-2] not needed
+        attn_implementation="eager",   # ← FIX
     )
     model = PeftModel.from_pretrained(
         base_model, hub_repo, subfolder=LORA_ADAPTER_DIR, is_trainable=True,
@@ -733,28 +1024,32 @@ def load_lora_from_hub(hub_repo, base_model_name, dtype, device_map):
 def build_lora_model(base_model_name, middle_layers, lora_r, lora_alpha,
                       lora_dropout, dtype, device_map):
     logger.info(f"[Setup] Loading base model: {base_model_name}")
+    # ── BUG FIX ──────────────────────────────────────────────────────────────
+    # attn_implementation="eager" is required so that output_attentions=True
+    # actually returns attention tensors.  The default "sdpa" backend silently
+    # returns an empty tuple, causing IndexError in forward_target_branch.
+    # ─────────────────────────────────────────────────────────────────────────
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name, torch_dtype=dtype, device_map=device_map,
         trust_remote_code=True,
-        output_attentions=False,   # [OPT-2]
+        attn_implementation="eager",   # ← FIX
     )
-
     target_modules = [
         f"model.layers.{l}.self_attn.{proj}"
         for l in middle_layers
         for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]
     ]
-    logger.info(f"[LoRA] Target modules ({len(target_modules)}): {target_modules[:4]} ...")
-
+    logger.info(f"[LoRA] Target modules ({len(target_modules)}): "
+                f"{target_modules[:4]} ...")
     lora_config = LoraConfig(
         r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
         target_modules=target_modules, bias="none", task_type="CAUSAL_LM",
     )
     model = get_peft_model(base_model, lora_config)
-
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total     = sum(p.numel() for p in model.parameters())
-    logger.info(f"[LoRA] Trainable: {trainable/1e6:.2f}M / {total/1e9:.3f}B ({100*trainable/total:.2f}%)")
+    logger.info(f"[LoRA] Trainable: {trainable/1e6:.2f}M / {total/1e9:.3f}B "
+                f"({100*trainable/total:.2f}%)")
     return model
 
 
@@ -773,29 +1068,9 @@ def build_state(args, hub_repo, completed_epochs, global_step,
         "batch_size": args.batch_size, "grad_accum": args.grad_accum,
         "lr": args.lr, "opus_ratio": args.opus_ratio,
         "eng_eng_ratio": args.eng_eng_ratio,
+        "seq_length": args.max_length,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-
-
-def plot_training_loss(loss_log, output_dir):
-    if not loss_log:
-        return
-    steps = [e["step"] for e in loss_log]
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
-    fig.suptitle("OT Alignment Training Progress", fontsize=14, fontweight="bold")
-    for ax, key, title, color in [
-        (axes[0, 0], "loss",    "Total Loss",    "steelblue"),
-        (axes[0, 1], "lm_loss", "L_LM",          "darkorange"),
-        (axes[1, 0], "ot_loss", "L_OT",          "forestgreen"),
-        (axes[1, 1], "lr",      "Learning Rate", "crimson"),
-    ]:
-        ax.plot(steps, [e[key] for e in loss_log], color=color, linewidth=0.8, alpha=0.7)
-        ax.set_title(title); ax.grid(True, alpha=0.3)
-        if key == "lr":
-            ax.ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
-    plt.tight_layout()
-    plt.savefig(output_dir / "ot_training_loss.png", dpi=150, bbox_inches="tight")
-    plt.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -804,47 +1079,43 @@ def plot_training_loss(loss_log, output_dir):
 
 def train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
+
+    if args.seq_length is not None:
+        args.max_length = args.seq_length
+    else:
+        args.seq_length = args.max_length
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Device & dtype ────────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         dtype = torch.bfloat16; amp_dtype = torch.bfloat16; use_amp = True
-        logger.info("[Setup] bfloat16 mixed precision")
+        logger.info("[Setup] bfloat16 AMP")
     elif args.fp16 and torch.cuda.is_available():
         dtype = torch.float16; amp_dtype = torch.float16; use_amp = True
-        logger.info("[Setup] float16 mixed precision")
+        logger.info("[Setup] float16 AMP")
     else:
         dtype = torch.float32; amp_dtype = torch.float32; use_amp = False
         logger.info("[Setup] float32")
 
     device_map = "auto" if torch.cuda.is_available() else None
 
-    # ── HF login ─────────────────────────────────────────────────────────────
     load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:
         login(token=hf_token)
-        logger.info("[Hub] Logged in")
-    else:
-        logger.warning("[Hub] HF_TOKEN not set")
 
-    hub_repo = _resolve_repo(args.hub_repo)
+    hub_repo      = _resolve_repo(args.hub_repo)
     middle_layers = resolve_middle_layers(args.middle_layers, n_total=32)
 
-    # ── [OPT-5] Optionally compile Sinkhorn ──────────────────────────────────
     global _sinkhorn_log_batched_inner
     if args.compile and hasattr(torch, "compile"):
-        logger.info("[OPT-5] torch.compile: compiling Sinkhorn kernel ...")
+        logger.info("[OPT-5] Compiling Sinkhorn kernel ...")
         _sinkhorn_log_batched_inner = torch.compile(
-            _sinkhorn_log_batched_inner,
-            mode="reduce-overhead",
-            fullgraph=True,
+            _sinkhorn_log_batched_inner, mode="reduce-overhead", fullgraph=True,
         )
-        logger.info("[OPT-5] Sinkhorn compiled.")
 
-    # ── Resume ────────────────────────────────────────────────────────────────
     training_state = load_training_state(hub_repo)
     is_resuming    = training_state is not None
 
@@ -856,7 +1127,6 @@ def train(args: argparse.Namespace) -> None:
         is_epoch_complete = training_state.get("is_epoch_complete", True)
         if is_epoch_complete or resume_epoch is None:
             resume_epoch = None; resume_skip_steps = 0
-
         model = load_lora_from_hub(hub_repo, args.base_model, dtype, device_map)
         if model is None:
             model = build_lora_model(
@@ -891,10 +1161,6 @@ def train(args: argparse.Namespace) -> None:
 
     layer_weights_module = LayerWeights(n_layers=len(middle_layers)).to(device)
 
-    # ── Dataset & DataLoader ──────────────────────────────────────────────────
-    logger.info(
-        f"[Data] opus_ratio={args.opus_ratio:.1%}  eng_eng_ratio={args.eng_eng_ratio:.1%}"
-    )
     align_dataset = AlignmentDataset(
         alignment_data_path=args.data_root,
         opus_sample_ratio=args.opus_ratio,
@@ -903,51 +1169,35 @@ def train(args: argparse.Namespace) -> None:
     align_dataset.stats()
 
     train_loader = AlignmentDataLoader(
-        dataset=align_dataset,
-        split="train",
-        source="joint",
-        tokenizer=tokenizer,
-        batch_size=args.batch_size,
-        max_length=args.max_length,
-        shuffle=True,
-        seed=args.seed,
-        # [OPT-8] persistent_workers + prefetch to keep pipeline full
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        dataset=align_dataset, split="train", source="joint",
+        tokenizer=tokenizer, batch_size=args.batch_size,
+        max_length=args.max_length, shuffle=True, seed=args.seed,
+        num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
     )
     logger.info(f"[Data] Train batches: {len(train_loader):,}")
 
-    # ── [OPT-9] Fused AdamW ──────────────────────────────────────────────────
     no_decay = {"bias", "LayerNorm.weight", "layer_norm.weight"}
-    lora_params_no_decay = [
-        p for n, p in model.named_parameters()
-        if p.requires_grad and not any(nd in n for nd in no_decay)
-    ]
-    lora_params_decay = [
-        p for n, p in model.named_parameters()
-        if p.requires_grad and any(nd in n for nd in no_decay)
-    ]
     param_groups = [
-        {"params": lora_params_no_decay, "weight_decay": args.weight_decay},
-        {"params": lora_params_decay,    "weight_decay": 0.0},
-        {"params": list(layer_weights_module.parameters()), "weight_decay": 0.0,
-         "lr": args.lr * 10},
+        {"params": [p for n, p in model.named_parameters()
+                    if p.requires_grad and not any(nd in n for nd in no_decay)],
+         "weight_decay": args.weight_decay},
+        {"params": [p for n, p in model.named_parameters()
+                    if p.requires_grad and any(nd in n for nd in no_decay)],
+         "weight_decay": 0.0},
+        {"params": list(layer_weights_module.parameters()),
+         "weight_decay": 0.0, "lr": args.lr * 10},
     ]
-
-    # Detect fused AdamW support (PyTorch ≥ 2.0)
     use_fused = (
         torch.cuda.is_available()
         and "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
     )
     optimizer = torch.optim.AdamW(
-        param_groups, lr=args.lr, eps=1e-8, betas=(0.9, 0.95),
-        fused=use_fused,
+        param_groups, lr=args.lr, eps=1e-8, betas=(0.9, 0.95), fused=use_fused,
     )
     if use_fused:
-        logger.info("[OPT-9] Using fused AdamW.")
+        logger.info("[OPT-9] Fused AdamW enabled.")
 
-    steps_per_epoch = len(train_loader)
-    # [OPT-6] Total optimizer steps = ceil(batch_steps / grad_accum) * epochs
+    steps_per_epoch     = len(train_loader)
     opt_steps_per_epoch = math.ceil(steps_per_epoch / args.grad_accum)
     total_steps         = opt_steps_per_epoch * args.epochs
     warmup_steps        = max(1, int(total_steps * args.warmup_ratio))
@@ -957,78 +1207,71 @@ def train(args: argparse.Namespace) -> None:
     scaler = GradScaler(device="cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
     logger.info(
-        f"[Setup] batch_steps/epoch={steps_per_epoch}  "
-        f"opt_steps/epoch={opt_steps_per_epoch}  total={total_steps}  warmup={warmup_steps}\n"
+        f"[Setup] steps/epoch={steps_per_epoch}  opt_steps/epoch={opt_steps_per_epoch}\n"
+        f"        total_steps={total_steps}  warmup={warmup_steps}\n"
         f"        grad_accum={args.grad_accum}  "
-        f"effective_batch={args.batch_size * args.grad_accum}\n"
-        f"        middle_layers={len(middle_layers)}  lambda_ot={args.lambda_ot}  "
-        f"sinkhorn_iters={args.sinkhorn_iters}  use_fused_adam={use_fused}"
+        f"eff_batch={args.batch_size * args.grad_accum}\n"
+        f"        seq_length={args.max_length}  layers={len(middle_layers)}\n"
+        f"        lambda_ot={args.lambda_ot}  eps={args.sinkhorn_eps}  "
+        f"iters={args.sinkhorn_iters}\n"
+        f"        real_attn_en={args.real_attn_en}  save_iter={args.save_iter}"
     )
 
-    if is_resuming:
-        loss_log = load_optimizer_states(
-            hub_repo, optimizer, scheduler, scaler, layer_weights_module, device,
-        )
-    else:
-        loss_log = []
+    loss_log    = load_optimizer_states(
+        hub_repo, optimizer, scheduler, scaler, layer_weights_module, device,
+    ) if is_resuming else []
 
     global_step = saved_global_step
-    log_file = open(
+    log_file    = open(
         output_dir / "ot_train_log.jsonl",
-        "a" if is_resuming else "w",
-        encoding="utf-8",
+        "a" if is_resuming else "w", encoding="utf-8",
     )
 
-    # ── Training loop ─────────────────────────────────────────────────────────
-    epoch_pbar = tqdm(
-        range(1, args.epochs + 1), desc="Epochs",
-        unit="epoch", dynamic_ncols=True, colour="green",
-    )
+    epoch_pbar = tqdm(range(1, args.epochs + 1), desc="Epochs",
+                      unit="epoch", dynamic_ncols=True, colour="green")
 
     for epoch in epoch_pbar:
         if epoch in completed_epochs:
-            logger.info(f"[Resume] Epoch {epoch} done — skip.")
+            logger.info(f"[Resume] Epoch {epoch} already done — skip.")
             continue
 
         skip_batches = resume_skip_steps if (epoch == resume_epoch) else 0
-
         logger.info(f"\n{'='*60}\nEPOCH {epoch}/{args.epochs}\n{'='*60}")
+
         train_loader.set_epoch(epoch)
         model.train()
         layer_weights_module.train()
         optimizer.zero_grad(set_to_none=True)
 
-        batch_pbar = tqdm(
-            desc=f"  Epoch {epoch}",
-            total=steps_per_epoch, unit="batch",
-            dynamic_ncols=True, leave=False,
-        )
+        batch_pbar = tqdm(desc=f"  Epoch {epoch}", total=steps_per_epoch,
+                          unit="batch", dynamic_ncols=True, leave=False)
 
-        # Running accumulators for logging
         accum_loss = accum_lm = accum_ot = 0.0
-        accum_count = 0
+        accum_count   = 0
         oom_skip_count = 0
         steps_in_epoch = 0
+        last_batch_for_viz: Optional[Dict[str, torch.Tensor]] = None
 
         for batch_idx, batch in enumerate(train_loader):
 
-            # ── Fast-forward for resume ───────────────────────────────────────
             if steps_in_epoch < skip_batches:
                 steps_in_epoch += 1
                 batch_pbar.update(1)
                 continue
 
-            # ── OOM cooldown ──────────────────────────────────────────────────
             if oom_skip_count > 0:
                 oom_skip_count -= 1
                 steps_in_epoch += 1
                 batch_pbar.update(1)
                 continue
 
-            # ── [OPT-6] Gradient accumulation ────────────────────────────────
-            # Scale loss by 1/grad_accum so gradients are mean over accum steps
-            is_last_accum = ((batch_idx + 1) % args.grad_accum == 0) or \
-                            (batch_idx + 1 == steps_per_epoch)
+            is_last_accum = (
+                (batch_idx + 1) % args.grad_accum == 0
+                or (batch_idx + 1 == steps_per_epoch)
+            )
+
+            last_batch_for_viz = {k: v.cpu() for k, v in batch.items()
+                                  if isinstance(v, torch.Tensor)}
 
             loss = None
             try:
@@ -1039,12 +1282,11 @@ def train(args: argparse.Namespace) -> None:
                     lambda_ot=args.lambda_ot,
                     sinkhorn_eps=args.sinkhorn_eps,
                     sinkhorn_iters=args.sinkhorn_iters,
+                    real_attn_en=args.real_attn_en,
                     amp_dtype=amp_dtype, use_amp=use_amp, device=device,
                 )
 
-                # Scale for accumulation
                 scaled_loss = loss / args.grad_accum
-
                 if use_amp and amp_dtype == torch.float16:
                     scaler.scale(scaled_loss).backward()
                 else:
@@ -1059,16 +1301,13 @@ def train(args: argparse.Namespace) -> None:
                 if not _is_oom(e):
                     raise
                 _cleanup_oom(optimizer, loss)
-                oom_skip_count = args.oom_skip_batches
-                new_bs = max(1, args.batch_size // 2)
-                if new_bs < args.batch_size:
-                    logger.warning(f"[OOM] batch_size {args.batch_size} → {new_bs}")
-                    args.batch_size = new_bs
+                oom_skip_count  = args.oom_skip_batches
+                args.batch_size = max(1, args.batch_size // 2)
+                logger.warning(f"[OOM] → batch_size={args.batch_size}")
                 steps_in_epoch += 1
                 batch_pbar.update(1)
                 continue
 
-            # ── Optimizer step (only every grad_accum steps) ──────────────────
             if is_last_accum:
                 if use_amp and amp_dtype == torch.float16:
                     scaler.unscale_(optimizer)
@@ -1077,7 +1316,9 @@ def train(args: argparse.Namespace) -> None:
                     [p for p in model.parameters() if p.requires_grad]
                     + list(layer_weights_module.parameters())
                 )
-                grad_norm = torch.nn.utils.clip_grad_norm_(all_trainable, args.max_grad_norm)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    all_trainable, args.max_grad_norm,
+                )
 
                 if use_amp and amp_dtype == torch.float16:
                     scaler.step(optimizer)
@@ -1089,38 +1330,64 @@ def train(args: argparse.Namespace) -> None:
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                # Log averaged over accumulation window
                 if accum_count > 0:
-                    avg_loss = accum_loss / accum_count
-                    avg_lm   = accum_lm   / accum_count
-                    avg_ot   = accum_ot   / accum_count
+                    avg_loss   = accum_loss  / accum_count
+                    avg_lm     = accum_lm    / accum_count
+                    avg_ot     = accum_ot    / accum_count
+                    avg_lam_ot = args.lambda_ot * avg_ot
                     current_lr = scheduler.get_last_lr()[0]
 
                     log_entry = {
-                        "epoch": epoch, "step": global_step,
-                        "loss": round(avg_loss, 6),
-                        "lm_loss": round(avg_lm, 6),
-                        "ot_loss": round(avg_ot, 6),
-                        "lr": current_lr,
+                        "epoch":     epoch,
+                        "step":      global_step,
+                        "loss":      round(avg_loss,   6),
+                        "lm_loss":   round(avg_lm,     6),
+                        "ot_loss":   round(avg_ot,     6),
+                        "lambda_ot": round(avg_lam_ot, 6),
+                        "lr":        current_lr,
                         "grad_norm": round(float(grad_norm), 4),
                     }
                     log_file.write(json.dumps(log_entry) + "\n")
                     log_file.flush()
                     loss_log.append(log_entry)
 
-                    batch_pbar.set_postfix(
-                        loss=f"{avg_loss:.4f}", lm=f"{avg_lm:.4f}",
-                        ot=f"{avg_ot:.4f}", lr=f"{current_lr:.2e}",
-                    )
-                    epoch_pbar.set_postfix(
-                        epoch=f"{epoch}/{args.epochs}",
-                        step=global_step, loss=f"{avg_loss:.4f}",
-                    )
-
+                    batch_pbar.set_postfix({
+                        "loss":   f"{avg_loss:.4f}",
+                        "lm":     f"{avg_lm:.4f}",
+                        "λ·OT":   f"{avg_lam_ot:.4f}",
+                        "OT_raw": f"{avg_ot:.4f}",
+                        "lr":     f"{current_lr:.2e}",
+                    })
+                    epoch_pbar.set_postfix({
+                        "ep": f"{epoch}/{args.epochs}",
+                        "step": global_step,
+                        "loss": f"{avg_loss:.4f}",
+                    })
                     accum_loss = accum_lm = accum_ot = accum_count = 0.0
 
-                # ── Mid-epoch checkpoint ──────────────────────────────────────
                 if args.save_iter > 0 and global_step % args.save_iter == 0:
+                    plot_training_loss(loss_log, output_dir, smooth=args.plot_smooth)
+
+                    transport_plot = None
+                    if last_batch_for_viz is not None:
+                        try:
+                            transport_plot = plot_ot_transport_diagnostic(
+                                model=model, tokenizer=tokenizer,
+                                batch=last_batch_for_viz,
+                                middle_layers=middle_layers,
+                                layer_weights_module=layer_weights_module,
+                                sinkhorn_eps=args.sinkhorn_eps,
+                                global_step=global_step, epoch=epoch,
+                                output_dir=output_dir,
+                                real_attn_en=args.real_attn_en,
+                                amp_dtype=amp_dtype, use_amp=use_amp, device=device,
+                            )
+                        except Exception as viz_err:
+                            logger.warning(f"[VizOT] failed: {viz_err}")
+                        finally:
+                            model.train()
+                            layer_weights_module.train()
+
                     mid_state = build_state(
                         args, hub_repo, completed_epochs, global_step,
                         current_epoch=epoch, steps_done_in_epoch=steps_in_epoch,
@@ -1133,7 +1400,9 @@ def train(args: argparse.Namespace) -> None:
                         optimizer=optimizer, scheduler=scheduler, scaler=scaler,
                         layer_weights_module=layer_weights_module,
                         loss_log=loss_log, epoch=epoch, private=args.hub_private,
+                        smooth=args.plot_smooth,
                         commit_suffix=f"step-{global_step}", delete_local=True,
+                        transport_plot_path=transport_plot,
                     )
                     model.train()
                     layer_weights_module.train()
@@ -1142,14 +1411,15 @@ def train(args: argparse.Namespace) -> None:
             batch_pbar.update(1)
 
         batch_pbar.close()
-        logger.info(f"\n[Epoch {epoch}] Done. global_step={global_step}")
+        logger.info(f"[Epoch {epoch}] Done. global_step={global_step}")
 
         lw_softmax = F.softmax(layer_weights_module.w.detach(), dim=0)
-        top_k = min(5, len(middle_layers))
-        top_indices = lw_softmax.topk(top_k).indices.tolist()
+        top_k      = min(5, len(middle_layers))
+        top_idx    = lw_softmax.topk(top_k).indices.tolist()
         logger.info(
             f"[Epoch {epoch}] Top-{top_k} layer weights: "
-            + ", ".join(f"L{middle_layers[i]}={lw_softmax[i].item():.4f}" for i in top_indices)
+            + ", ".join(f"L{middle_layers[i]}={lw_softmax[i].item():.4f}"
+                        for i in top_idx)
         )
 
         completed_epochs.append(epoch)
@@ -1164,18 +1434,18 @@ def train(args: argparse.Namespace) -> None:
             scheduler=scheduler, scaler=scaler,
             layer_weights_module=layer_weights_module,
             loss_log=loss_log, epoch=epoch, private=args.hub_private,
+            smooth=args.plot_smooth,
             commit_suffix="", delete_local=True,
         )
-        plot_training_loss(loss_log, output_dir)
 
     epoch_pbar.close()
     log_file.close()
 
-    logger.info("\n" + "="*60)
+    logger.info("\n" + "=" * 60)
     logger.info("OT ALIGNMENT TRAINING COMPLETE")
     lw_final = F.softmax(layer_weights_module.w.detach(), dim=0).tolist()
     logger.info(f"  Completed: {completed_epochs}  |  Steps: {global_step}")
-    logger.info(f"  Final layer weights: {[round(v,4) for v in lw_final]}")
+    logger.info(f"  Final layer weights: {[round(v, 4) for v in lw_final]}")
 
     with open(output_dir / "ot_final_report.json", "w", encoding="utf-8") as f:
         json.dump({
@@ -1185,11 +1455,13 @@ def train(args: argparse.Namespace) -> None:
             "lambda_ot": args.lambda_ot, "sinkhorn_eps": args.sinkhorn_eps,
             "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
             "opus_ratio": args.opus_ratio, "eng_eng_ratio": args.eng_eng_ratio,
-            "grad_accum": args.grad_accum, "effective_batch": args.batch_size * args.grad_accum,
+            "grad_accum": args.grad_accum,
+            "effective_batch": args.batch_size * args.grad_accum,
+            "seq_length": args.max_length, "real_attn_en": args.real_attn_en,
             "final_layer_weights": lw_final,
         }, f, indent=2, ensure_ascii=False)
 
-    plot_training_loss(loss_log, output_dir)
+    plot_training_loss(loss_log, output_dir, smooth=args.plot_smooth)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1200,10 +1472,10 @@ if __name__ == "__main__":
     args = parse_args()
 
     logger.info("=" * 65)
-    logger.info("Llama-3-8B — Stage 2: OT Alignment [OPTIMISED]")
+    logger.info("Llama-3-8B  Stage 2: OT Alignment  [Paper-correct + GPU-optimised]")
     logger.info("=" * 65)
     for k, v in vars(args).items():
-        logger.info(f"  {k:25s}: {v}")
+        logger.info(f"  {k:28s}: {v}")
     logger.info("=" * 65)
 
     train(args)
