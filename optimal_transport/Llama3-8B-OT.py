@@ -14,6 +14,7 @@ Eq. 15     : Uniform marginals  a_i = 1/s_tgt,  b_j = 1/s_en
 Eq. 16     : C(l)_ij = 1 − ⟨h(l)_tgt,i , h(l)_dom,j⟩  (cosine distance on unit vecs)
 Eq. 17     : OT(l) = ⟨C(l), T*(l)⟩_F    (plain Frobenius inner product, no division)
 Eq. 18     : L_OT = Σ_l softmax(w)_l · OT(l)    (learnable layer weights)
+             OR (--mean_layer True): L_OT = mean_l OT(l)   (uniform mean, no collapse)
 Eq. 19-20  : L = L_LM + λ · L_OT   (causal LM on target branch only)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -51,7 +52,8 @@ Usage
         --opus_ratio    0.05 \\
         --eng_eng_ratio 0.30 \\
         --seq_length    512 \\
-        --save_iter     200
+        --save_iter     200 \\
+        --mean_layer    False
 """
 
 import argparse
@@ -169,9 +171,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compile",         action="store_true", default=False)
 
     # Whether to use real attention weights for the frozen EN branch too.
-    # Costs extra memory but is more faithful to eq.13 for both branches.
     p.add_argument("--real_attn_en",    action="store_true", default=False,
                    help="Use real attention weights for EN branch (more memory).")
+
+    # [NEW] --mean_layer: if True, aggregate OT losses across layers with simple
+    # uniform mean instead of learnable softmax weights (eq. 18).
+    # Avoids softmax winner-takes-all collapse where only 1-2 layers dominate.
+    # Default: False (keep learnable weights, paper-faithful).
+    p.add_argument(
+        "--mean_layer",
+        type=lambda x: x.lower() in ("true", "1", "yes"),
+        default=False,
+        metavar="BOOL",
+        help=(
+            "If True, replace learnable softmax layer weights (eq.18) with "
+            "uniform mean pooling across middle layers. Prevents softmax "
+            "collapse. Default: False (paper-faithful learnable weights)."
+        ),
+    )
 
     p.add_argument("--plot_smooth",     type=int,   default=20)
 
@@ -301,6 +318,7 @@ def compute_ot_loss_single_layer(
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LayerWeights  —  eq. (18)
+# Used only when --mean_layer False (default).
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LayerWeights(nn.Module):
@@ -345,11 +363,6 @@ def forward_target_branch(
     Returns:
       logits:     [B, s, V]   for L_LM (eq. 20)
       layer_data: dict  layer_idx → (hidden [B,s,d], attn [B,H,s,s])
-
-    FIX: Model must be loaded with attn_implementation='eager' so that
-         output_attentions=True actually populates out.attentions.
-         With 'sdpa' (PyTorch default), out.attentions is an empty tuple
-         and out.attentions[l] raises IndexError.
     """
     with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
         out = model(
@@ -360,11 +373,6 @@ def forward_target_branch(
             use_cache=False,
         )
 
-    # Validate attentions were actually returned
-    # ── BUG FIX ──────────────────────────────────────────────────────────────
-    # With sdpa backend, out.attentions may be None or an empty tuple even
-    # when output_attentions=True is requested.  Guard and fall back to uniform
-    # pooling in that case so training does not crash.
     has_attentions = (
         out.attentions is not None
         and len(out.attentions) > 0
@@ -375,13 +383,11 @@ def forward_target_branch(
             "the model was likely loaded without attn_implementation='eager'. "
             "Falling back to uniform attention pooling for this batch."
         )
-    # ─────────────────────────────────────────────────────────────────────────
 
     layer_data: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
     for l in middle_layers:
-        hidden = out.hidden_states[l + 1]          # [B, s, d]
-        # out.attentions is indexed 0..N_layers-1 (one entry per layer)
-        attn = out.attentions[l] if has_attentions else None   # [B, H, s, s] or None
+        hidden = out.hidden_states[l + 1]
+        attn = out.attentions[l] if has_attentions else None
         layer_data[l] = (hidden, attn)
 
     return out.logits, layer_data
@@ -414,14 +420,11 @@ def forward_dominant_branch(
     finally:
         model.enable_adapter_layers()
 
-    # ── BUG FIX ──────────────────────────────────────────────────────────────
-    # Same guard as in forward_target_branch: sdpa may return empty attentions.
     has_attentions = (
         real_attn_en
         and out.attentions is not None
         and len(out.attentions) > 0
     )
-    # ─────────────────────────────────────────────────────────────────────────
 
     layer_data: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
     for l in middle_layers:
@@ -440,11 +443,12 @@ def compute_total_loss(
     model,
     batch:                  dict,
     middle_layers:          List[int],
-    layer_weights_module:   LayerWeights,
+    layer_weights_module:   LayerWeights,   # used only when mean_layer=False
     lambda_ot:              float,
     sinkhorn_eps:           float,
     sinkhorn_iters:         int,
     real_attn_en:           bool,
+    mean_layer:             bool,           # [NEW] True → uniform mean across layers
     amp_dtype:              torch.dtype,
     use_amp:                bool,
     device:                 torch.device,
@@ -475,14 +479,11 @@ def compute_total_loss(
         tgt_hidden, tgt_attn = tgt_layer_data[l]
         en_hidden,  en_attn  = en_layer_data[l]
 
-        # Eqs. 13–14: attention-weighted pooling + L2 normalisation
-        # TARGET branch: use real attn if available, else uniform fallback
         if tgt_attn is not None:
             h_tgt = attention_weighted_pool_from_attn(tgt_hidden, tgt_attn, tgt_mask)
         else:
             h_tgt = attention_weighted_pool_uniform(tgt_hidden, tgt_mask)
 
-        # DOMINANT branch: real attn if available, else uniform fallback
         if en_attn is not None:
             h_en = attention_weighted_pool_from_attn(en_hidden, en_attn, en_mask)
         else:
@@ -494,9 +495,17 @@ def compute_total_loss(
         )
         ot_losses.append(ot_l)
 
-    # Eq. 18
+    # ── Eq. 18: aggregate across layers ─────────────────────────────────────
+    # [NEW] Two modes controlled by --mean_layer:
+    #   mean_layer=False (default): learnable softmax weights — paper faithful
+    #                               but prone to winner-takes-all collapse.
+    #   mean_layer=True:            uniform mean — every layer contributes
+    #                               equally, no collapse, no extra parameters.
     if ot_losses:
-        loss_ot = layer_weights_module(ot_losses)
+        if mean_layer:
+            loss_ot = torch.stack(ot_losses).mean()
+        else:
+            loss_ot = layer_weights_module(ot_losses)
     else:
         loss_ot = torch.tensor(0.0, device=device)
 
@@ -616,7 +625,6 @@ def _decode_tokens(tokenizer, ids: torch.Tensor) -> List[str]:
                                clean_up_tokenization_spaces=False).strip()
         if not tok:
             tok = f"[{id_}]"
-        # No truncation — show full token text
         out.append(tok)
     return out
 
@@ -633,6 +641,7 @@ def plot_ot_transport_diagnostic(
     epoch:                int,
     output_dir:           Path,
     real_attn_en:         bool,
+    mean_layer:           bool,             # [NEW] controls layer_w display
     amp_dtype:            torch.dtype,
     use_amp:              bool,
     device:               torch.device,
@@ -680,7 +689,12 @@ def plot_ot_transport_diagnostic(
         tgt_pooled[l] = h_t
         en_pooled[l]  = h_e
 
-    layer_w = F.softmax(layer_weights_module.w.detach().float(), dim=0).cpu().numpy()
+    # [NEW] layer_w: uniform when mean_layer=True, softmax(w) when False
+    n_layers = len(middle_layers)
+    if mean_layer:
+        layer_w = np.ones(n_layers, dtype=np.float32) / n_layers
+    else:
+        layer_w = F.softmax(layer_weights_module.w.detach().float(), dim=0).cpu().numpy()
 
     h_tgt_agg = sum(layer_w[li] * tgt_pooled[l]
                     for li, l in enumerate(middle_layers))
@@ -712,20 +726,17 @@ def plot_ot_transport_diagnostic(
     labels_tgt = _decode_tokens(tokenizer, tgt_ids[sample_idx][:tgt_real])
     labels_en  = _decode_tokens(tokenizer, en_ids[sample_idx][:en_real])
 
-    # ── White / light theme ───────────────────────────────────────────────
     _BG       = "white"
     _PANEL_BG = "#f8f9fa"
     _TEXT     = "#1a1a1a"
     _GRID     = "#cccccc"
     _SPINE    = "#999999"
 
-    # ── Dynamic figure size — scale with number of tokens ────────────────
     n_tgt = len(labels_tgt)
     n_en  = len(labels_en)
-    # Map panel: needs enough pixels per token for readability
-    map_w  = max(10, n_tgt * 0.55)   # ~0.55 inch per target token
-    map_h  = max(8,  n_en  * 0.45)   # ~0.45 inch per EN token
-    fig_w  = map_w + 8                # right panels ~8 inch wide
+    map_w  = max(10, n_tgt * 0.55)
+    map_h  = max(8,  n_en  * 0.45)
+    fig_w  = map_w + 8
     fig_h  = max(map_h, 10)
 
     fig = plt.figure(figsize=(fig_w, fig_h), facecolor=_BG)
@@ -745,10 +756,8 @@ def plot_ot_transport_diagnostic(
         ax.yaxis.label.set_color(_TEXT)
         ax.title.set_color(_TEXT)
 
-    # ── Panel A: Transport Map ────────────────────────────────────────────
-    T_display = T_agg.T   # [n_en, n_tgt]
+    T_display = T_agg.T
 
-    # Font size: scale down for many tokens, floor at 5
     TICK_x = max(5, min(9, int(160 / max(n_tgt, 1))))
     TICK_y = max(5, min(9, int(160 / max(n_en,  1))))
 
@@ -764,13 +773,12 @@ def plot_ot_transport_diagnostic(
     ax_map.set_ylabel("Dominant EN tokens (frozen, eq.12)", fontsize=9, color=_TEXT)
     ax_map.set_title(
         f"Aggregated OT Transport Map  (step {global_step}, epoch {epoch})\n"
-        f"OT = {ot_agg_scalar:.5f}   ε={sinkhorn_eps}   |L|={len(middle_layers)}",
+        f"OT = {ot_agg_scalar:.5f}   ε={sinkhorn_eps}   |L|={n_layers}",
         fontsize=9, fontweight="bold", color=_TEXT, pad=8,
     )
     cbar = fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
     cbar.ax.tick_params(labelsize=7, colors=_TEXT)
 
-    # Show cell values only when the grid is small enough to be readable
     if n_tgt <= 30 and n_en <= 30:
         val_fs = max(4, min(7, int(120 / max(n_tgt, n_en))))
         for ri in range(n_en):
@@ -780,16 +788,21 @@ def plot_ot_transport_diagnostic(
                 ax_map.text(ci, ri, f"{v:.3f}", ha="center", va="center",
                             fontsize=val_fs, color=cell_color)
 
-    # ── Panel B: Layer Weights ────────────────────────────────────────────
+    # [NEW] Layer weights panel title reflects mode
     layer_labels = [f"L{l}" for l in middle_layers]
+    lw_title = (
+        "mean(OT)  —  uniform  —  step {s}"
+        if mean_layer else
+        "softmax(w)  —  eq.18  —  step {s}"
+    ).format(s=global_step)
+
     im_w = ax_layer.imshow(layer_w.reshape(1, -1), cmap="viridis",
                             aspect="auto", vmin=0, vmax=layer_w.max())
-    ax_layer.set_xticks(range(len(middle_layers)))
+    ax_layer.set_xticks(range(n_layers))
     ax_layer.set_xticklabels(layer_labels, rotation=60, ha="right",
                               fontsize=6, color=_TEXT)
     ax_layer.set_yticks([])
-    ax_layer.set_title(f"softmax(w)  —  eq.18  —  step {global_step}",
-                        fontsize=9, fontweight="bold", color=_TEXT, pad=6)
+    ax_layer.set_title(lw_title, fontsize=9, fontweight="bold", color=_TEXT, pad=6)
     for li, wv in enumerate(layer_w):
         cell_color = "white" if wv > 0.6 * layer_w.max() else "#222"
         ax_layer.text(li, 0, f"{wv:.3f}", ha="center", va="center",
@@ -798,13 +811,12 @@ def plot_ot_transport_diagnostic(
                            orientation="horizontal")
     cbar_w.ax.tick_params(labelsize=6, colors=_TEXT)
 
-    # ── Panel C: Per-layer OT scalar bar chart ────────────────────────────
-    bar_colours = plt.cm.viridis(np.linspace(0.15, 0.85, len(middle_layers)))
-    bars = ax_bar.bar(range(len(middle_layers)), per_layer_ot,
+    bar_colours = plt.cm.viridis(np.linspace(0.15, 0.85, n_layers))
+    bars = ax_bar.bar(range(n_layers), per_layer_ot,
                       color=bar_colours, edgecolor=_SPINE, linewidth=0.7)
     for bar, wv in zip(bars, layer_w):
         bar.set_alpha(0.55 + 0.45 * wv / (layer_w.max() + 1e-9))
-    ax_bar.set_xticks(range(len(middle_layers)))
+    ax_bar.set_xticks(range(n_layers))
     ax_bar.set_xticklabels(layer_labels, rotation=60, ha="right",
                             fontsize=6, color=_TEXT)
     ax_bar.set_ylabel("OT(l) = ⟨C(l), T*(l)⟩_F  (eq.17)", fontsize=8, color=_TEXT)
@@ -816,9 +828,10 @@ def plot_ot_transport_diagnostic(
                     f"{v:.4f}", ha="center", va="bottom",
                     fontsize=5, color=_TEXT, rotation=60)
 
+    mode_label = "mean_layer=True (uniform)" if mean_layer else "mean_layer=False (learnable)"
     fig.suptitle(
-        "OT Diagnostic  —  Transport Map  ·  Layer Weights  ·  Per-layer Loss\n"
-        f"Step {global_step}  |  Epoch {epoch}  |  eqs. 13–18",
+        f"OT Diagnostic  —  Transport Map  ·  Layer Weights  ·  Per-layer Loss\n"
+        f"Step {global_step}  |  Epoch {epoch}  |  eqs. 13–18  |  {mode_label}",
         fontsize=11, fontweight="bold", color=_TEXT, y=1.01,
     )
     fig.patch.set_facecolor(_BG)
@@ -904,17 +917,23 @@ def load_training_state(hub_repo: str) -> Optional[Dict]:
 
 
 def load_optimizer_states(hub_repo, optimizer, scheduler, scaler,
-                           layer_weights_module, device) -> List[Dict]:
-    for fname, loader in [
+                           layer_weights_module, mean_layer, device) -> List[Dict]:
+    loaders = [
         (OPTIMIZER_STATE_FILE, lambda p: optimizer.load_state_dict(
             torch.load(p, map_location=device))),
         (SCHEDULER_STATE_FILE, lambda p: scheduler.load_state_dict(
             torch.load(p, map_location="cpu"))),
         (SCALER_STATE_FILE,    lambda p: scaler.load_state_dict(
             torch.load(p, map_location="cpu"))),
-        (LAYER_WEIGHTS_FILE,   lambda p: layer_weights_module.load_state_dict(
-            torch.load(p, map_location=device))),
-    ]:
+    ]
+    # [NEW] Only load layer weights when using learnable mode
+    if not mean_layer:
+        loaders.append(
+            (LAYER_WEIGHTS_FILE, lambda p: layer_weights_module.load_state_dict(
+                torch.load(p, map_location=device)))
+        )
+
+    for fname, loader in loaders:
         path = _download_hub_file(hub_repo, fname)
         if path:
             try:
@@ -936,7 +955,7 @@ def load_optimizer_states(hub_repo, optimizer, scheduler, scaler,
 def save_and_push_checkpoint(
     hub_repo, output_dir, state, model, tokenizer,
     optimizer, scheduler, scaler, layer_weights_module,
-    loss_log, epoch, private, smooth,
+    loss_log, epoch, private, smooth, mean_layer,
     commit_suffix="", delete_local=True,
     transport_plot_path: Optional[Path] = None,
 ):
@@ -961,7 +980,11 @@ def save_and_push_checkpoint(
     torch.save(optimizer.state_dict(), opt_path)
     torch.save(scheduler.state_dict(), sch_path)
     torch.save(scaler.state_dict(),    scl_path)
-    torch.save(layer_weights_module.state_dict(), lw_path)
+
+    # [NEW] Only save layer weights when using learnable mode
+    if not mean_layer:
+        torch.save(layer_weights_module.state_dict(), lw_path)
+
     with open(ll_path, "w", encoding="utf-8") as f:
         json.dump(loss_log, f)
 
@@ -974,10 +997,13 @@ def save_and_push_checkpoint(
         (opt_path,   OPTIMIZER_STATE_FILE),
         (sch_path,   SCHEDULER_STATE_FILE),
         (scl_path,   SCALER_STATE_FILE),
-        (lw_path,    LAYER_WEIGHTS_FILE),
         (ll_path,    LOSS_LOG_FILE),
         (plot_path,  "ot_training_loss.png"),
     ]
+    # [NEW] Only upload layer weights file when using learnable mode
+    if not mean_layer and lw_path.exists():
+        files_to_upload.append((lw_path, LAYER_WEIGHTS_FILE))
+
     if transport_plot_path is not None and transport_plot_path.exists():
         files_to_upload.append(
             (transport_plot_path, f"diagnostics/{transport_plot_path.name}")
@@ -991,7 +1017,10 @@ def save_and_push_checkpoint(
     if delete_local:
         if lora_dir.exists():
             shutil.rmtree(lora_dir)
-        for f in [state_path, opt_path, sch_path, scl_path, lw_path, ll_path]:
+        cleanup = [state_path, opt_path, sch_path, scl_path, ll_path]
+        if not mean_layer:
+            cleanup.append(lw_path)
+        for f in cleanup:
             if f.exists():
                 f.unlink()
 
@@ -1004,15 +1033,10 @@ def load_lora_from_hub(hub_repo, base_model_name, dtype, device_map):
             return None
     except Exception:
         return None
-    # ── BUG FIX ──────────────────────────────────────────────────────────────
-    # attn_implementation="eager" is required so that output_attentions=True
-    # actually returns attention tensors.  The default "sdpa" backend silently
-    # returns an empty tuple, causing IndexError in forward_target_branch.
-    # ─────────────────────────────────────────────────────────────────────────
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name, torch_dtype=dtype, device_map=device_map,
         trust_remote_code=True,
-        attn_implementation="eager",   # ← FIX
+        attn_implementation="eager",
     )
     model = PeftModel.from_pretrained(
         base_model, hub_repo, subfolder=LORA_ADAPTER_DIR, is_trainable=True,
@@ -1024,15 +1048,10 @@ def load_lora_from_hub(hub_repo, base_model_name, dtype, device_map):
 def build_lora_model(base_model_name, middle_layers, lora_r, lora_alpha,
                       lora_dropout, dtype, device_map):
     logger.info(f"[Setup] Loading base model: {base_model_name}")
-    # ── BUG FIX ──────────────────────────────────────────────────────────────
-    # attn_implementation="eager" is required so that output_attentions=True
-    # actually returns attention tensors.  The default "sdpa" backend silently
-    # returns an empty tuple, causing IndexError in forward_target_branch.
-    # ─────────────────────────────────────────────────────────────────────────
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name, torch_dtype=dtype, device_map=device_map,
         trust_remote_code=True,
-        attn_implementation="eager",   # ← FIX
+        attn_implementation="eager",
     )
     target_modules = [
         f"model.layers.{l}.self_attn.{proj}"
@@ -1069,6 +1088,7 @@ def build_state(args, hub_repo, completed_epochs, global_step,
         "lr": args.lr, "opus_ratio": args.opus_ratio,
         "eng_eng_ratio": args.eng_eng_ratio,
         "seq_length": args.max_length,
+        "mean_layer": args.mean_layer,          # [NEW] persisted in state
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -1108,6 +1128,14 @@ def train(args: argparse.Namespace) -> None:
 
     hub_repo      = _resolve_repo(args.hub_repo)
     middle_layers = resolve_middle_layers(args.middle_layers, n_total=32)
+
+    # [NEW] Log which layer aggregation mode is active
+    if args.mean_layer:
+        logger.info("[Setup] Layer aggregation: UNIFORM MEAN (--mean_layer True) "
+                    "— no softmax collapse, no learnable weights")
+    else:
+        logger.info("[Setup] Layer aggregation: LEARNABLE SOFTMAX (--mean_layer False) "
+                    "— paper eq.18, prone to collapse if not monitored")
 
     global _sinkhorn_log_batched_inner
     if args.compile and hasattr(torch, "compile"):
@@ -1159,6 +1187,8 @@ def train(args: argparse.Namespace) -> None:
         )
         logger.info("[Setup] Gradient checkpointing: ON")
 
+    # LayerWeights always instantiated for compatibility, but only used/trained
+    # when mean_layer=False.
     layer_weights_module = LayerWeights(n_layers=len(middle_layers)).to(device)
 
     align_dataset = AlignmentDataset(
@@ -1184,9 +1214,14 @@ def train(args: argparse.Namespace) -> None:
         {"params": [p for n, p in model.named_parameters()
                     if p.requires_grad and any(nd in n for nd in no_decay)],
          "weight_decay": 0.0},
-        {"params": list(layer_weights_module.parameters()),
-         "weight_decay": 0.0, "lr": args.lr * 10},
     ]
+    # [NEW] Only add layer_weights to optimizer when using learnable mode
+    if not args.mean_layer:
+        param_groups.append(
+            {"params": list(layer_weights_module.parameters()),
+             "weight_decay": 0.0, "lr": args.lr * 10}
+        )
+
     use_fused = (
         torch.cuda.is_available()
         and "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
@@ -1214,11 +1249,13 @@ def train(args: argparse.Namespace) -> None:
         f"        seq_length={args.max_length}  layers={len(middle_layers)}\n"
         f"        lambda_ot={args.lambda_ot}  eps={args.sinkhorn_eps}  "
         f"iters={args.sinkhorn_iters}\n"
-        f"        real_attn_en={args.real_attn_en}  save_iter={args.save_iter}"
+        f"        mean_layer={args.mean_layer}  "  # [NEW]
+        f"real_attn_en={args.real_attn_en}  save_iter={args.save_iter}"
     )
 
-    loss_log    = load_optimizer_states(
-        hub_repo, optimizer, scheduler, scaler, layer_weights_module, device,
+    loss_log = load_optimizer_states(
+        hub_repo, optimizer, scheduler, scaler,
+        layer_weights_module, args.mean_layer, device,
     ) if is_resuming else []
 
     global_step = saved_global_step
@@ -1240,7 +1277,8 @@ def train(args: argparse.Namespace) -> None:
 
         train_loader.set_epoch(epoch)
         model.train()
-        layer_weights_module.train()
+        if not args.mean_layer:
+            layer_weights_module.train()
         optimizer.zero_grad(set_to_none=True)
 
         batch_pbar = tqdm(desc=f"  Epoch {epoch}", total=steps_per_epoch,
@@ -1283,6 +1321,7 @@ def train(args: argparse.Namespace) -> None:
                     sinkhorn_eps=args.sinkhorn_eps,
                     sinkhorn_iters=args.sinkhorn_iters,
                     real_attn_en=args.real_attn_en,
+                    mean_layer=args.mean_layer,         # [NEW]
                     amp_dtype=amp_dtype, use_amp=use_amp, device=device,
                 )
 
@@ -1312,10 +1351,11 @@ def train(args: argparse.Namespace) -> None:
                 if use_amp and amp_dtype == torch.float16:
                     scaler.unscale_(optimizer)
 
-                all_trainable = (
-                    [p for p in model.parameters() if p.requires_grad]
-                    + list(layer_weights_module.parameters())
-                )
+                # [NEW] Grad clip: include layer_weights only when learnable
+                all_trainable = [p for p in model.parameters() if p.requires_grad]
+                if not args.mean_layer:
+                    all_trainable += list(layer_weights_module.parameters())
+
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     all_trainable, args.max_grad_norm,
                 )
@@ -1380,13 +1420,15 @@ def train(args: argparse.Namespace) -> None:
                                 global_step=global_step, epoch=epoch,
                                 output_dir=output_dir,
                                 real_attn_en=args.real_attn_en,
+                                mean_layer=args.mean_layer,     # [NEW]
                                 amp_dtype=amp_dtype, use_amp=use_amp, device=device,
                             )
                         except Exception as viz_err:
                             logger.warning(f"[VizOT] failed: {viz_err}")
                         finally:
                             model.train()
-                            layer_weights_module.train()
+                            if not args.mean_layer:
+                                layer_weights_module.train()
 
                     mid_state = build_state(
                         args, hub_repo, completed_epochs, global_step,
@@ -1400,12 +1442,13 @@ def train(args: argparse.Namespace) -> None:
                         optimizer=optimizer, scheduler=scheduler, scaler=scaler,
                         layer_weights_module=layer_weights_module,
                         loss_log=loss_log, epoch=epoch, private=args.hub_private,
-                        smooth=args.plot_smooth,
+                        smooth=args.plot_smooth, mean_layer=args.mean_layer,  # [NEW]
                         commit_suffix=f"step-{global_step}", delete_local=True,
                         transport_plot_path=transport_plot,
                     )
                     model.train()
-                    layer_weights_module.train()
+                    if not args.mean_layer:
+                        layer_weights_module.train()
 
             steps_in_epoch += 1
             batch_pbar.update(1)
@@ -1413,14 +1456,21 @@ def train(args: argparse.Namespace) -> None:
         batch_pbar.close()
         logger.info(f"[Epoch {epoch}] Done. global_step={global_step}")
 
-        lw_softmax = F.softmax(layer_weights_module.w.detach(), dim=0)
-        top_k      = min(5, len(middle_layers))
-        top_idx    = lw_softmax.topk(top_k).indices.tolist()
-        logger.info(
-            f"[Epoch {epoch}] Top-{top_k} layer weights: "
-            + ", ".join(f"L{middle_layers[i]}={lw_softmax[i].item():.4f}"
-                        for i in top_idx)
-        )
+        # [NEW] Layer weight logging only relevant when learnable
+        if not args.mean_layer:
+            lw_softmax = F.softmax(layer_weights_module.w.detach(), dim=0)
+            top_k      = min(5, len(middle_layers))
+            top_idx    = lw_softmax.topk(top_k).indices.tolist()
+            logger.info(
+                f"[Epoch {epoch}] Top-{top_k} layer weights: "
+                + ", ".join(f"L{middle_layers[i]}={lw_softmax[i].item():.4f}"
+                            for i in top_idx)
+            )
+        else:
+            logger.info(
+                f"[Epoch {epoch}] Layer aggregation: uniform mean over "
+                f"{len(middle_layers)} layers (mean_layer=True)"
+            )
 
         completed_epochs.append(epoch)
         state = build_state(
@@ -1434,7 +1484,7 @@ def train(args: argparse.Namespace) -> None:
             scheduler=scheduler, scaler=scaler,
             layer_weights_module=layer_weights_module,
             loss_log=loss_log, epoch=epoch, private=args.hub_private,
-            smooth=args.plot_smooth,
+            smooth=args.plot_smooth, mean_layer=args.mean_layer,    # [NEW]
             commit_suffix="", delete_local=True,
         )
 
@@ -1443,23 +1493,32 @@ def train(args: argparse.Namespace) -> None:
 
     logger.info("\n" + "=" * 60)
     logger.info("OT ALIGNMENT TRAINING COMPLETE")
-    lw_final = F.softmax(layer_weights_module.w.detach(), dim=0).tolist()
     logger.info(f"  Completed: {completed_epochs}  |  Steps: {global_step}")
-    logger.info(f"  Final layer weights: {[round(v, 4) for v in lw_final]}")
+
+    final_report = {
+        "base_model": args.base_model, "hub_repo": hub_repo,
+        "epochs": args.epochs, "completed_epochs": completed_epochs,
+        "global_step": global_step, "middle_layers": middle_layers,
+        "lambda_ot": args.lambda_ot, "sinkhorn_eps": args.sinkhorn_eps,
+        "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
+        "opus_ratio": args.opus_ratio, "eng_eng_ratio": args.eng_eng_ratio,
+        "grad_accum": args.grad_accum,
+        "effective_batch": args.batch_size * args.grad_accum,
+        "seq_length": args.max_length, "real_attn_en": args.real_attn_en,
+        "mean_layer": args.mean_layer,      # [NEW]
+    }
+
+    # [NEW] Only log/store layer weights when learnable mode was used
+    if not args.mean_layer:
+        lw_final = F.softmax(layer_weights_module.w.detach(), dim=0).tolist()
+        logger.info(f"  Final layer weights: {[round(v, 4) for v in lw_final]}")
+        final_report["final_layer_weights"] = lw_final
+    else:
+        n = len(middle_layers)
+        final_report["final_layer_weights"] = [round(1.0 / n, 4)] * n
 
     with open(output_dir / "ot_final_report.json", "w", encoding="utf-8") as f:
-        json.dump({
-            "base_model": args.base_model, "hub_repo": hub_repo,
-            "epochs": args.epochs, "completed_epochs": completed_epochs,
-            "global_step": global_step, "middle_layers": middle_layers,
-            "lambda_ot": args.lambda_ot, "sinkhorn_eps": args.sinkhorn_eps,
-            "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
-            "opus_ratio": args.opus_ratio, "eng_eng_ratio": args.eng_eng_ratio,
-            "grad_accum": args.grad_accum,
-            "effective_batch": args.batch_size * args.grad_accum,
-            "seq_length": args.max_length, "real_attn_en": args.real_attn_en,
-            "final_layer_weights": lw_final,
-        }, f, indent=2, ensure_ascii=False)
+        json.dump(final_report, f, indent=2, ensure_ascii=False)
 
     plot_training_loss(loss_log, output_dir, smooth=args.plot_smooth)
 
