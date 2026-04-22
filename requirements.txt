@@ -8,3 +8,4 @@ pandas
 matplotlib
 python-dotenv
 huggingface_hub
+peft

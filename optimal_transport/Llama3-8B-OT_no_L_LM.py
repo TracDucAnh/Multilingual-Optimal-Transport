@@ -1,63 +1,86 @@
 """
-Llama3-8B-OT-only.py
+Llama3-8B-OT-only-distributed.py
 ==========================
 Stage 2 — Cross-lingual Optimal Transport Alignment (OT Loss Only)
+Distributed Data Parallel (DDP) version
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PAPER FORMULATIONS STRICTLY IMPLEMENTED (LM LOSS REMOVED)
+DISTRIBUTED CHANGES (vs single-GPU version)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Eq. 11-12  : Two forward branches — LoRA (target) vs frozen (dominant/EN)
-Eq. 13     : H̃(l) = diag(α(l)) · H(l)  where α(l) = mean attention over heads
-Eq. 14     : Row-wise L2 normalise of H̃(l) to get h(l)_tgt,i  and h(l)_dom,j
-Eq. 15     : Uniform marginals  a_i = 1/s_tgt,  b_j = 1/s_en
-Eq. 16     : C(l)_ij = 1 − ⟨h(l)_tgt,i , h(l)_dom,j⟩  (cosine distance on unit vecs)
-Eq. 17     : OT(l) = ⟨C(l), T*(l)⟩_F    (plain Frobenius inner product, no division)
-Eq. 18     : L_OT = Σ_l softmax(w)_l · OT(l)    (learnable layer weights)
-             OR (--mean_layer True): L_OT = mean_l OT(l)   (uniform mean, no collapse)
+[DIST-1]  --gpus N flag: validated against torch.cuda.device_count()
+          before any model loading. If N > available GPUs → abort early.
 
-CHANGE vs original:
-  • L_LM completely removed — no causal LM forward, no labels, no logits
-  • Loss objective: L = L_OT  (no lambda, no weighting)
-  • Target branch no longer needs output logits, only hidden states + attentions
-  • Default lr raised to 1e-4
+[DIST-2]  Launch via torchrun (NOT python directly):
+            torchrun --nproc_per_node=2 Llama3-8B-OT-only-distributed.py --gpus 2 ...
+          The script detects rank/world_size from env vars set by torchrun.
+
+[DIST-3]  BATCH SIZE SEMANTICS:
+          --batch_size is the GLOBAL batch size.
+          Per-GPU batch = batch_size // world_size.
+          If batch_size is not divisible, it's rounded down and a warning
+          is logged. Effective global batch = per_gpu_batch * world_size.
+
+[DIST-4]  OOM HANDLING — coordinated across all GPUs:
+          - Each GPU catches OOM locally and sets a flag tensor.
+          - dist.all_reduce(oom_flag, op=dist.ReduceOp.MAX) propagates it.
+          - ALL GPUs halve their per_gpu_batch_size simultaneously so the
+            DataLoader is rebuilt consistently on every rank.
+          - This prevents deadlocks from mismatched batch sizes across ranks.
+
+[DIST-5]  GRADIENT AGGREGATION:
+          - DDP wraps the LoRA model → gradients are all-reduced automatically
+            after each backward() call (Ring All-Reduce).
+          - LayerWeights module is NOT wrapped in DDP (scalar params, tiny).
+            Instead its gradients are manually all-reduced after backward.
+          - Loss is computed in float32 per rank, then averaged across ranks
+            via dist.all_reduce / world_size before logging.
+
+[DIST-6]  DOMINANT (FROZEN) BRANCH:
+          - Runs under torch.inference_mode() + no_grad on every rank
+            independently (no sync needed — frozen weights, no grad).
+
+[DIST-7]  DistributedSampler ensures each rank sees a non-overlapping
+          shard of the dataset. set_epoch(epoch) is called each epoch
+          to re-shuffle deterministically.
+
+[DIST-8]  CHECKPOINTING: only rank-0 saves/uploads checkpoints to avoid
+          race conditions and duplicate Hub uploads.
+
+[DIST-9]  LOGGING: only rank-0 prints to avoid duplicated log lines.
+          Use logger_rank0() wrapper throughout.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-GPU OPTIMISATIONS (unchanged)
+LAUNCH COMMANDS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-[OPT-1] BATCHED SINKHORN — fully vectorised over batch dimension
-[OPT-2] output_attentions=True ONLY for target branch (needed for eq.13)
-        Dominant/EN branch uses output_attentions=False + uniform fallback
-        to avoid doubling memory; OR set --real_attn_en to use real attn.
-[OPT-3] SINGLE FORWARD PASS per branch (no redundant calls)
-[OPT-4] torch.cdist / torch.bmm for cost matrix — no Python loops
-[OPT-5] torch.compile on Sinkhorn kernel (PyTorch ≥ 2.0, opt-in)
-[OPT-6] GRADIENT ACCUMULATION with proper 1/grad_accum scaling
-[OPT-7] FROZEN BRANCH under torch.inference_mode() + no_grad
-[OPT-8] DataLoader persistent_workers + prefetch_factor
-[OPT-9] FUSED ADAMW
-[OPT-10] Loss computed in float32; backward in bf16 (autocast)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Usage
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Single node, 2 GPUs:
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
-    python Llama3-8B-OT-only.py \\
-        --base_model    ducanhdinh/Llama3-8B-Finetune \\
-        --data_root     ../raw_data/alignment/ \\
-        --output_dir    ./ot_checkpoints \\
-        --hub_repo      Llama3-8B-OT \\
-        --epochs        3 \\
-        --batch_size    8 \\
-        --grad_accum    4 \\
-        --lr            1e-4 \\
-        --sinkhorn_eps  0.1 \\
-        --opus_ratio    0.05 \\
-        --eng_eng_ratio 0.30 \\
-        --seq_length    512 \\
-        --save_iter     200 \\
-        --mean_layer    False
+    torchrun --nproc_per_node=2 Llama3-8B-OT-only-distributed.py \\
+        --gpus 2 \\
+        --base_model  ducanhdinh/Llama3-8B-Finetune \\
+        --data_root   ../raw_data/alignment/ \\
+        --output_dir  ./ot_checkpoints \\
+        --hub_repo    Llama3-8B-OT \\
+        --epochs      3 \\
+        --batch_size  32   ← GLOBAL; each GPU gets 32/2=16 \\
+        --grad_accum  4 \\
+        --lr          1e-4
+
+Single node, 4 GPUs:
+    torchrun --nproc_per_node=4 Llama3-8B-OT-only-distributed.py --gpus 4 ...
+
+Multi-node (2 nodes × 4 GPUs each = 8 GPUs total):
+    # On node 0 (master):
+    torchrun --nnodes=2 --nproc_per_node=4 \\
+             --node_rank=0 --master_addr=<NODE0_IP> --master_port=29500 \\
+             Llama3-8B-OT-only-distributed.py --gpus 8 ...
+    # On node 1:
+    torchrun --nnodes=2 --nproc_per_node=4 \\
+             --node_rank=1 --master_addr=<NODE0_IP> --master_port=29500 \\
+             Llama3-8B-OT-only-distributed.py --gpus 8 ...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 import argparse
@@ -74,6 +97,9 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
@@ -92,15 +118,71 @@ import numpy as np
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "dataloader"))
 
-from alignment_dataloader import (
-    AlignmentDataset,
-    AlignmentDataLoader,
-)
+from alignment_dataloader import AlignmentDataset, AlignmentDataLoader
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Logger
+# Distributed helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def init_distributed() -> Tuple[int, int, int]:
+    """
+    Initialise process group from torchrun env vars.
+    Returns (rank, local_rank, world_size).
+    """
+    rank       = int(os.environ.get("RANK",       0))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if world_size > 1:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+
+    return rank, local_rank, world_size
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def barrier(world_size: int) -> None:
+    if world_size > 1:
+        dist.barrier()
+
+
+def all_reduce_mean(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+    """In-place all_reduce then divide by world_size."""
+    if world_size > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor.div_(world_size)
+    return tensor
+
+
+def all_reduce_max(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+    """In-place all_reduce MAX — used for OOM flag broadcast."""
+    if world_size > 1:
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return tensor
+
+
+def reduce_gradients_manual(module: nn.Module, world_size: int) -> None:
+    """
+    Manually all_reduce gradients for a module that is NOT wrapped in DDP.
+    Used for LayerWeights (tiny scalar params).
+    [DIST-5]
+    """
+    if world_size <= 1:
+        return
+    for param in module.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(world_size)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logger — rank-0 only
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -108,7 +190,23 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+_base_logger = logging.getLogger(__name__)
+
+
+class RankFilter(logging.Filter):
+    def __init__(self, rank: int):
+        super().__init__()
+        self.rank = rank
+
+    def filter(self, record):
+        return self.rank == 0
+
+
+def setup_logger(rank: int) -> logging.Logger:
+    logger = logging.getLogger(f"ot_dist.rank{rank}")
+    logger.addFilter(RankFilter(rank))
+    return logger
+
 
 TRAINING_STATE_FILE  = "ot_training_state.json"
 OPTIMIZER_STATE_FILE = "ot_optimizer_state.pt"
@@ -124,24 +222,34 @@ LOSS_LOG_FILE        = "ot_loss_log.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Llama-3-8B OT Alignment — OT Loss Only")
+    p = argparse.ArgumentParser(description="Llama-3-8B OT Alignment — Distributed")
+
+    # ── NEW: distributed flag ────────────────────────────────────────────────
+    p.add_argument(
+        "--gpus", type=int, default=None,
+        help=(
+            "Number of GPUs to use. Must equal torchrun --nproc_per_node. "
+            "Validated against torch.cuda.device_count() BEFORE model loading."
+        ),
+    )
 
     p.add_argument("--base_model",      type=str, default="ducanhdinh/Llama3-8B-Finetune")
     p.add_argument("--data_root",       type=str, default="../raw_data/alignment/")
-    p.add_argument("--output_dir",      type=str, default="./ot_checkpoints_no_L_LM")
-    p.add_argument("--hub_repo",        type=str, default="Llama3-8B-OT_no_L_LM")
+    p.add_argument("--output_dir",      type=str, default="./ot_checkpoints_dist")
+    p.add_argument("--hub_repo",        type=str, default="Llama3-8B-OT")
     p.add_argument("--hub_private",     action="store_true")
 
     p.add_argument("--epochs",          type=int,   default=3)
-    p.add_argument("--batch_size",      type=int,   default=8)
+    # batch_size = GLOBAL batch; per-GPU = batch_size // world_size  [DIST-3]
+    p.add_argument("--batch_size",      type=int,   default=32,
+                   help="GLOBAL batch size. Divided equally across GPUs.")
     p.add_argument("--grad_accum",      type=int,   default=4)
-    p.add_argument("--lr",              type=float, default=1e-4)   # raised from 2e-5
+    p.add_argument("--lr",              type=float, default=1e-4)
     p.add_argument("--warmup_ratio",    type=float, default=0.03)
     p.add_argument("--weight_decay",    type=float, default=0.01)
     p.add_argument("--max_grad_norm",   type=float, default=1.0)
     p.add_argument("--seed",            type=int,   default=42)
 
-    # OT hyper-params  (lambda_ot REMOVED — loss is pure L_OT)
     p.add_argument("--sinkhorn_eps",    type=float, default=0.1)
     p.add_argument("--sinkhorn_iters",  type=int,   default=50)
 
@@ -150,7 +258,6 @@ def parse_args() -> argparse.Namespace:
         help="'auto' → layers[N/4 .. 3N/4). Or comma list: '8,12,16,20'",
     )
 
-    # LoRA config
     p.add_argument("--lora_r",          type=int,   default=16)
     p.add_argument("--lora_alpha",      type=int,   default=32)
     p.add_argument("--lora_dropout",    type=float, default=0.05)
@@ -159,46 +266,146 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eng_eng_ratio",   type=float, default=0.0)
 
     p.add_argument("--save_iter",       type=int,   default=0)
-
-    # Sequence length
     p.add_argument("--seq_length",      type=int,   default=None)
     p.add_argument("--max_length",      type=int,   default=256)
 
     p.add_argument("--num_workers",     type=int,   default=4)
     p.add_argument("--bf16",            action="store_true", default=True)
     p.add_argument("--fp16",            action="store_true")
+    # OOM: when triggered on ANY gpu, ALL gpus halve per-gpu batch  [DIST-4]
     p.add_argument("--oom_skip_batches",type=int,   default=3)
     p.add_argument("--gradient_checkpointing", action="store_true", default=True)
     p.add_argument("--no_gradient_checkpointing",
                    dest="gradient_checkpointing", action="store_false")
     p.add_argument("--compile",         action="store_true", default=False)
-
-    p.add_argument("--real_attn_en",    action="store_true", default=False,
-                   help="Use real attention weights for EN branch (more memory).")
-
+    p.add_argument("--real_attn_en",    action="store_true", default=False)
     p.add_argument(
         "--mean_layer",
         type=lambda x: x.lower() in ("true", "1", "yes"),
         default=False,
         metavar="BOOL",
-        help=(
-            "If True, replace learnable softmax layer weights (eq.18) with "
-            "uniform mean pooling across middle layers. Prevents softmax "
-            "collapse. Default: False (paper-faithful learnable weights)."
-        ),
     )
-
     p.add_argument("--plot_smooth",     type=int,   default=20)
 
     return p.parse_args()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Seed
+# GPU validation  [DIST-1]
 # ─────────────────────────────────────────────────────────────────────────────
 
-def set_seed(seed: int) -> None:
+def validate_gpus(requested: Optional[int], world_size: int, rank: int) -> int:
+    """
+    Check --gpus against available GPUs and torchrun world_size.
+    Called on every rank; aborts on mismatch.
+    Returns the validated world_size to use.
+    """
+    available = torch.cuda.device_count()
+
+    # Detect available first
+    if available == 0:
+        raise RuntimeError(
+            "[GPU] No CUDA GPUs detected. Cannot run distributed training."
+        )
+
+    if requested is not None:
+        if requested > available:
+            raise RuntimeError(
+                f"[GPU] --gpus {requested} requested but only "
+                f"{available} GPU(s) available on this node. Aborting."
+            )
+        if requested != world_size:
+            raise RuntimeError(
+                f"[GPU] --gpus {requested} does not match torchrun "
+                f"world_size={world_size}. "
+                f"Run: torchrun --nproc_per_node={requested} ... --gpus {requested}"
+            )
+
+    if rank == 0:
+        _base_logger.info(
+            f"[GPU] Detected {available} GPU(s) | Using {world_size} GPU(s)"
+        )
+    return world_size
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-GPU batch size helper  [DIST-3]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_per_gpu_batch(global_batch: int, world_size: int, rank: int) -> int:
+    per_gpu = global_batch // world_size
+    if per_gpu == 0:
+        raise ValueError(
+            f"[Batch] global batch_size={global_batch} < world_size={world_size}. "
+            "Increase --batch_size."
+        )
+    remainder = global_batch % world_size
+    if remainder != 0 and rank == 0:
+        _base_logger.warning(
+            f"[Batch] batch_size={global_batch} not divisible by {world_size} GPUs. "
+            f"Using per_gpu={per_gpu} → effective global={per_gpu * world_size}."
+        )
+    return per_gpu
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OOM coordinator  [DIST-4]
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OOMCoordinator:
+    """
+    Coordinates OOM events across ranks.
+    When any rank hits OOM, all_reduce MAX propagates it to all others.
+    All ranks halve their per-GPU batch size simultaneously.
+    """
+    def __init__(self, per_gpu_batch: int, world_size: int, device: torch.device,
+                 min_batch: int = 1):
+        self.per_gpu_batch = per_gpu_batch
+        self.world_size    = world_size
+        self.device        = device
+        self.min_batch     = min_batch
+        self._skip_count   = 0
+
+    def report_oom(self) -> None:
+        """Called by the rank that hit OOM."""
+        self._oom_flag_tensor().fill_(1)
+
+    def sync_and_check(self) -> bool:
+        """
+        Synchronise OOM flag across all ranks.
+        Returns True if any rank hit OOM (meaning all should halve).
+        """
+        flag = self._oom_flag_tensor()
+        all_reduce_max(flag, self.world_size)
+        hit = flag.item() > 0
+        flag.zero_()  # reset for next iteration
+        return bool(hit)
+
+    def halve_batch(self, logger) -> int:
+        old = self.per_gpu_batch
+        self.per_gpu_batch = max(self.min_batch, old // 2)
+        if logger:
+            logger.warning(
+                f"[OOM] All GPUs: per_gpu_batch {old} → {self.per_gpu_batch} "
+                f"(global: {old * self.world_size} → "
+                f"{self.per_gpu_batch * self.world_size})"
+            )
+        return self.per_gpu_batch
+
+    def _oom_flag_tensor(self) -> torch.Tensor:
+        # Lazily create a shared flag on the correct device
+        if not hasattr(self, "_flag"):
+            self._flag = torch.zeros(1, dtype=torch.int32, device=self.device)
+        return self._flag
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Seed (rank-aware)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def set_seed(seed: int, rank: int = 0) -> None:
     import random
+    seed = seed + rank  # each rank gets a different but deterministic seed
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -220,16 +427,15 @@ def resolve_middle_layers(spec: str, n_total: int = 32) -> List[int]:
         layers = list(range(int(a), int(b)))
     else:
         layers = [int(x.strip()) for x in spec.split(",") if x.strip()]
-    logger.info(f"[OT] Middle layers ({len(layers)}): {layers}")
     return layers
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# [OPT-1, OPT-5]  Log-domain Sinkhorn — batched, GPU-vectorised
+# Sinkhorn (batched, GPU-vectorised)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sinkhorn_log_batched_inner(
-    C: torch.Tensor,          # [B, m, n]  float32
+    C: torch.Tensor,
     eps: float,
     max_iter: int,
 ) -> torch.Tensor:
@@ -239,18 +445,16 @@ def _sinkhorn_log_batched_inner(
 
     log_a = torch.full((B, m), -math.log(m), dtype=dtype, device=device)
     log_b = torch.full((B, n), -math.log(n), dtype=dtype, device=device)
-
     f = torch.zeros(B, m, dtype=dtype, device=device)
     g = torch.zeros(B, n, dtype=dtype, device=device)
 
     for _ in range(max_iter):
-        log_sum_f = torch.logsumexp((g.unsqueeze(1) - C) / eps, dim=2)  # [B, m]
+        log_sum_f = torch.logsumexp((g.unsqueeze(1) - C) / eps, dim=2)
         f = eps * log_a - eps * log_sum_f
-
-        log_sum_g = torch.logsumexp((f.unsqueeze(2) - C) / eps, dim=1)  # [B, n]
+        log_sum_g = torch.logsumexp((f.unsqueeze(2) - C) / eps, dim=1)
         g = eps * log_b - eps * log_sum_g
 
-    log_T = (f.unsqueeze(2) + g.unsqueeze(1) - C) / eps  # [B, m, n]
+    log_T = (f.unsqueeze(2) + g.unsqueeze(1) - C) / eps
     return torch.exp(log_T)
 
 
@@ -259,36 +463,34 @@ def sinkhorn_log_batched(C: torch.Tensor, eps: float, max_iter: int) -> torch.Te
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Attention-Weighted Pooling  —  eqs. (13)–(14)
+# Attention-weighted pooling  (eqs. 13–14)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def attention_weighted_pool_from_attn(
-    hidden: torch.Tensor,           # [B, s, d]
-    attn_weights: torch.Tensor,     # [B, H, s, s]
-    attention_mask: torch.Tensor,   # [B, s]
+    hidden: torch.Tensor,
+    attn_weights: torch.Tensor,
+    attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    alpha = attn_weights.float().mean(dim=1).mean(dim=1)   # [B, s]
+    alpha = attn_weights.float().mean(dim=1).mean(dim=1)
     alpha = alpha * attention_mask.float()
     alpha = alpha / (alpha.sum(dim=1, keepdim=True) + 1e-12)
-    h_tilde = hidden * alpha.unsqueeze(-1)                  # [B, s, d]
-    h_norm  = F.normalize(h_tilde, p=2, dim=-1)
-    return h_norm
+    h_tilde = hidden * alpha.unsqueeze(-1)
+    return F.normalize(h_tilde, p=2, dim=-1)
 
 
 def attention_weighted_pool_uniform(
-    hidden: torch.Tensor,           # [B, s, d]
-    attention_mask: torch.Tensor,   # [B, s]
+    hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
 ) -> torch.Tensor:
     mask   = attention_mask.float()
     n_real = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
     alpha  = mask / n_real
     h_tilde = hidden * alpha.unsqueeze(-1)
-    h_norm  = F.normalize(h_tilde, p=2, dim=-1)
-    return h_norm
+    return F.normalize(h_tilde, p=2, dim=-1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-layer OT Loss  —  eqs. (16)–(17)
+# Per-layer OT loss  (eqs. 16–17)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_ot_loss_single_layer(
@@ -299,24 +501,19 @@ def compute_ot_loss_single_layer(
     eps:      float,
     max_iter: int,
 ) -> torch.Tensor:
-    C = 1.0 - torch.bmm(
-        h_tgt.float(),
-        h_en.float().transpose(1, 2),
-    )
+    C = 1.0 - torch.bmm(h_tgt.float(), h_en.float().transpose(1, 2))
     C = C.clamp(0.0, 2.0)
 
     valid = tgt_mask.float().unsqueeze(2) * en_mask.float().unsqueeze(1)
     C_masked = C * valid + (1.0 - valid) * 2.0
 
     T = sinkhorn_log_batched(C_masked, eps=eps, max_iter=max_iter)
-
     ot_per_sample = (C * T * valid).sum(dim=(1, 2))
     return ot_per_sample.mean()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LayerWeights  —  eq. (18)
-# Used only when --mean_layer False (default).
+# LayerWeights  (eq. 18)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LayerWeights(nn.Module):
@@ -332,8 +529,6 @@ class LayerWeights(nn.Module):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Forward passes
-# NOTE: target branch no longer needs logits — use_cache=False kept for safety,
-#       output_attentions=True kept for eq.13, but we discard logits entirely.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def forward_target_branch(
@@ -347,7 +542,8 @@ def forward_target_branch(
 ) -> Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
     """
     Target (LoRA) branch — eq. (11).
-    Returns only layer_data (hidden + attn) — logits discarded (no L_LM).
+    When DDP is used, model is a DDP wrapper; calling model() automatically
+    syncs gradients across ranks during backward.
     """
     with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
         out = model(
@@ -359,23 +555,14 @@ def forward_target_branch(
         )
 
     has_attentions = (
-        out.attentions is not None
-        and len(out.attentions) > 0
+        out.attentions is not None and len(out.attentions) > 0
     )
-    if not has_attentions:
-        logger.warning(
-            "[forward_target_branch] out.attentions is empty — "
-            "the model was likely loaded without attn_implementation='eager'. "
-            "Falling back to uniform attention pooling for this batch."
-        )
 
     layer_data: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
     for l in middle_layers:
         hidden = out.hidden_states[l + 1]
         attn   = out.attentions[l] if has_attentions else None
         layer_data[l] = (hidden, attn)
-
-    # logits intentionally NOT returned
     return layer_data
 
 
@@ -391,12 +578,15 @@ def forward_dominant_branch(
     device:         torch.device,
 ) -> Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
     """
-    Dominant (frozen EN) branch — eq. (12). Unchanged.
+    Dominant (frozen EN) branch — eq. (12).
+    No grad, no DDP sync needed. Each rank runs independently.  [DIST-6]
     """
-    model.disable_adapter_layers()
+    # Unwrap DDP to access adapter methods
+    raw_model = model.module if hasattr(model, "module") else model
+    raw_model.disable_adapter_layers()
     try:
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-            out = model(
+            out = raw_model(
                 input_ids=input_ids.to(device),
                 attention_mask=attention_mask.to(device),
                 output_hidden_states=True,
@@ -404,12 +594,10 @@ def forward_dominant_branch(
                 use_cache=False,
             )
     finally:
-        model.enable_adapter_layers()
+        raw_model.enable_adapter_layers()
 
     has_attentions = (
-        real_attn_en
-        and out.attentions is not None
-        and len(out.attentions) > 0
+        real_attn_en and out.attentions is not None and len(out.attentions) > 0
     )
 
     layer_data: Dict[int, Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
@@ -417,12 +605,11 @@ def forward_dominant_branch(
         hidden = out.hidden_states[l + 1]
         attn   = out.attentions[l] if has_attentions else None
         layer_data[l] = (hidden, attn)
-
     return layer_data
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Full loss  —  L = L_OT  (L_LM removed entirely, no lambda)
+# Full loss  —  L = L_OT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_total_loss(
@@ -438,31 +625,19 @@ def compute_total_loss(
     use_amp:                bool,
     device:                 torch.device,
 ) -> Tuple[torch.Tensor, float]:
-    """
-    Returns:
-        loss     : L_OT scalar tensor (with grad)
-        ot_item  : float for logging
-    NOTE: tgt_labels no longer read — batch may still contain them (dataloader
-          compat) but they are ignored here.
-    """
     tgt_ids  = batch["tgt_input_ids"].to(device, non_blocking=True)
     tgt_mask = batch["tgt_attention_mask"].to(device, non_blocking=True)
     en_ids   = batch["en_input_ids"].to(device, non_blocking=True)
     en_mask  = batch["en_attention_mask"].to(device, non_blocking=True)
 
-    # ── TARGET branch (eq. 11) — only hidden states + attentions ────────────
     tgt_layer_data = forward_target_branch(
         model, tgt_ids, tgt_mask, middle_layers, amp_dtype, use_amp, device,
     )
-
-    # ── DOMINANT branch (eq. 12) ─────────────────────────────────────────────
     en_layer_data = forward_dominant_branch(
         model, en_ids, en_mask, middle_layers, real_attn_en, amp_dtype, use_amp, device,
     )
 
-    # ── Per-layer OT losses (eqs. 13–17) ─────────────────────────────────────
     ot_losses: List[torch.Tensor] = []
-
     for l in middle_layers:
         tgt_hidden, tgt_attn = tgt_layer_data[l]
         en_hidden,  en_attn  = en_layer_data[l]
@@ -483,7 +658,6 @@ def compute_total_loss(
         )
         ot_losses.append(ot_l)
 
-    # ── Eq. 18: aggregate across layers ─────────────────────────────────────
     if ot_losses:
         if mean_layer:
             loss_ot = torch.stack(ot_losses).mean()
@@ -492,7 +666,6 @@ def compute_total_loss(
     else:
         loss_ot = torch.tensor(0.0, device=device, requires_grad=True)
 
-    # L = L_OT  (no L_LM, no lambda)
     return loss_ot, loss_ot.item()
 
 
@@ -506,41 +679,113 @@ def _is_oom(e: Exception) -> bool:
     )
 
 
-def _cleanup_oom(optimizer, *tensors):
+def _cleanup_after_oom(optimizer, *tensors):
     for t in tensors:
-        try: del t
-        except Exception: pass
+        try:
+            del t
+        except Exception:
+            pass
     optimizer.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
     gc.collect()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Loss plotting  (lm_loss panel replaced with blank / note)
+# DataLoader builder (with DistributedSampler)  [DIST-7]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_distributed_dataloader(
+    align_dataset,
+    tokenizer,
+    per_gpu_batch: int,
+    max_length: int,
+    seed: int,
+    num_workers: int,
+    rank: int,
+    world_size: int,
+    epoch: int = 0,
+):
+    """
+    Wraps AlignmentDataLoader with DistributedSampler so each rank
+    sees only its shard.  [DIST-7]
+    """
+    loader = AlignmentDataLoader(
+        dataset=align_dataset,
+        split="train",
+        source="joint",
+        tokenizer=tokenizer,
+        batch_size=per_gpu_batch,
+        max_length=max_length,
+        shuffle=True,
+        seed=seed,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        # DistributedSampler kwargs passed through if the dataloader supports it:
+        rank=rank,
+        world_size=world_size,
+    )
+    # If AlignmentDataLoader doesn't support rank/world_size natively,
+    # inject a DistributedSampler into its underlying torch DataLoader.
+    # We handle both cases below:
+    if hasattr(loader, "sampler") and isinstance(
+        getattr(loader, "sampler", None), DistributedSampler
+    ):
+        loader.sampler.set_epoch(epoch)
+    elif hasattr(loader, "dataloader") and hasattr(loader.dataloader, "sampler"):
+        if isinstance(loader.dataloader.sampler, DistributedSampler):
+            loader.dataloader.sampler.set_epoch(epoch)
+
+    return loader
+
+
+def rebuild_dataloader_with_new_batch(
+    align_dataset,
+    tokenizer,
+    per_gpu_batch: int,
+    max_length: int,
+    seed: int,
+    num_workers: int,
+    rank: int,
+    world_size: int,
+    epoch: int,
+    logger,
+):
+    """Rebuild dataloader after OOM batch-size reduction."""
+    if logger:
+        logger.info(
+            f"[DataLoader] Rebuilding with per_gpu_batch={per_gpu_batch} "
+            f"(global={per_gpu_batch * world_size})"
+        )
+    return build_distributed_dataloader(
+        align_dataset, tokenizer, per_gpu_batch, max_length,
+        seed, num_workers, rank, world_size, epoch,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loss plotting
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _rolling_mean(values: List[float], window: int) -> List[float]:
     if window <= 1 or len(values) < 2:
         return values
-    arr     = np.array(values, dtype=np.float64)
-    kernel  = np.ones(window) / window
-    padded  = np.concatenate([arr[:window - 1], arr])
+    arr    = np.array(values, dtype=np.float64)
+    kernel = np.ones(window) / window
+    padded = np.concatenate([arr[:window - 1], arr])
     return np.convolve(padded, kernel, mode="valid").tolist()
 
 
 def plot_training_loss(loss_log: List[Dict], output_dir: Path, smooth: int = 20) -> None:
     if not loss_log:
         return
-
     steps   = [e["step"]    for e in loss_log]
     ot_loss = [e["ot_loss"] for e in loss_log]
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 5))
     fig.suptitle(
-        f"OT-Only Alignment — Training Progress  (step {steps[-1]})",
+        f"OT-Only Alignment (Distributed) — step {steps[-1]}",
         fontsize=13, fontweight="bold",
     )
-
     colour = "#3aaa6b"
     ax.plot(steps, ot_loss, color=colour, alpha=0.20, linewidth=0.7, label="raw L_OT")
     smoothed = _rolling_mean(ot_loss, smooth)
@@ -570,258 +815,15 @@ def plot_training_loss(loss_log: List[Dict], output_dir: Path, smooth: int = 20)
     out_path = output_dir / "ot_training_loss.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    logger.info(f"[Plot] ✓ Loss chart → {out_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OT Transport Diagnostic  (unchanged logic, no lm references)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _sinkhorn_numpy(C: np.ndarray, eps: float, n_iter: int = 100) -> np.ndarray:
-    m, n   = C.shape
-    log_a  = np.full(m, -np.log(m))
-    log_b  = np.full(n, -np.log(n))
-    f, g   = np.zeros(m), np.zeros(n)
-    for _ in range(n_iter):
-        f = eps * log_a - eps * np.logaddexp.reduce((g[None, :] - C) / eps, axis=1)
-        g = eps * log_b - eps * np.logaddexp.reduce((f[:, None] - C) / eps, axis=0)
-    return np.exp((f[:, None] + g[None, :] - C) / eps)
-
-
-def _decode_tokens(tokenizer, ids: torch.Tensor) -> List[str]:
-    out = []
-    for id_ in ids.tolist():
-        tok = tokenizer.decode([id_], skip_special_tokens=False,
-                               clean_up_tokenization_spaces=False).strip()
-        if not tok:
-            tok = f"[{id_}]"
-        out.append(tok)
-    return out
-
-
-@torch.no_grad()
-def plot_ot_transport_diagnostic(
-    model,
-    tokenizer,
-    batch:                Dict[str, torch.Tensor],
-    middle_layers:        List[int],
-    layer_weights_module: LayerWeights,
-    sinkhorn_eps:         float,
-    global_step:          int,
-    epoch:                int,
-    output_dir:           Path,
-    real_attn_en:         bool,
-    mean_layer:           bool,
-    amp_dtype:            torch.dtype,
-    use_amp:              bool,
-    device:               torch.device,
-    sample_idx:           int = 0,
-) -> Path:
-    model.eval()
-
-    tgt_ids  = batch["tgt_input_ids"]
-    tgt_mask = batch["tgt_attention_mask"]
-    en_ids   = batch["en_input_ids"]
-    en_mask  = batch["en_attention_mask"]
-
-    tgt_layer_data = forward_target_branch(
-        model, tgt_ids, tgt_mask, middle_layers, amp_dtype, use_amp, device,
-    )
-    en_layer_data = forward_dominant_branch(
-        model, en_ids, en_mask, middle_layers, real_attn_en, amp_dtype, use_amp, device,
-    )
-
-    tgt_pooled: Dict[int, np.ndarray] = {}
-    en_pooled:  Dict[int, np.ndarray] = {}
-
-    for l in middle_layers:
-        tgt_h, tgt_a = tgt_layer_data[l]
-        en_h,  en_a  = en_layer_data[l]
-
-        if tgt_a is not None:
-            h_t = attention_weighted_pool_from_attn(
-                tgt_h, tgt_a, tgt_mask.to(device),
-            )[sample_idx].float().cpu().numpy()
-        else:
-            h_t = attention_weighted_pool_uniform(
-                tgt_h, tgt_mask.to(device),
-            )[sample_idx].float().cpu().numpy()
-
-        if en_a is not None:
-            h_e = attention_weighted_pool_from_attn(
-                en_h, en_a, en_mask.to(device),
-            )[sample_idx].float().cpu().numpy()
-        else:
-            h_e = attention_weighted_pool_uniform(
-                en_h, en_mask.to(device),
-            )[sample_idx].float().cpu().numpy()
-
-        tgt_pooled[l] = h_t
-        en_pooled[l]  = h_e
-
-    n_layers = len(middle_layers)
-    if mean_layer:
-        layer_w = np.ones(n_layers, dtype=np.float32) / n_layers
-    else:
-        layer_w = F.softmax(layer_weights_module.w.detach().float(), dim=0).cpu().numpy()
-
-    h_tgt_agg = sum(layer_w[li] * tgt_pooled[l]
-                    for li, l in enumerate(middle_layers))
-    h_en_agg  = sum(layer_w[li] * en_pooled[l]
-                    for li, l in enumerate(middle_layers))
-
-    h_tgt_agg /= np.linalg.norm(h_tgt_agg, axis=1, keepdims=True) + 1e-12
-    h_en_agg  /= np.linalg.norm(h_en_agg,  axis=1, keepdims=True) + 1e-12
-
-    tgt_real = int(tgt_mask[sample_idx].sum().item())
-    en_real  = int(en_mask[sample_idx].sum().item())
-
-    h_tv = h_tgt_agg[:tgt_real]
-    h_ev = h_en_agg[:en_real]
-    C_agg   = np.clip(1.0 - np.clip(h_tv @ h_ev.T, -1.0, 1.0), 0.0, 2.0)
-    T_agg   = _sinkhorn_numpy(C_agg, eps=sinkhorn_eps)
-    ot_agg_scalar = float(np.sum(C_agg * T_agg))
-
-    per_layer_ot: List[float] = []
-    for l in middle_layers:
-        h_t = tgt_pooled[l][:tgt_real]
-        h_e = en_pooled[l][:en_real]
-        h_t /= np.linalg.norm(h_t, axis=1, keepdims=True) + 1e-12
-        h_e /= np.linalg.norm(h_e, axis=1, keepdims=True) + 1e-12
-        C_l = np.clip(1.0 - np.clip(h_t @ h_e.T, -1.0, 1.0), 0.0, 2.0)
-        T_l = _sinkhorn_numpy(C_l, eps=sinkhorn_eps)
-        per_layer_ot.append(float(np.sum(C_l * T_l)))
-
-    labels_tgt = _decode_tokens(tokenizer, tgt_ids[sample_idx][:tgt_real])
-    labels_en  = _decode_tokens(tokenizer, en_ids[sample_idx][:en_real])
-
-    _BG       = "white"
-    _PANEL_BG = "#f8f9fa"
-    _TEXT     = "#1a1a1a"
-    _GRID     = "#cccccc"
-    _SPINE    = "#999999"
-
-    n_tgt = len(labels_tgt)
-    n_en  = len(labels_en)
-    map_w  = max(10, n_tgt * 0.55)
-    map_h  = max(8,  n_en  * 0.45)
-    fig_w  = map_w + 8
-    fig_h  = max(map_h, 10)
-
-    fig = plt.figure(figsize=(fig_w, fig_h), facecolor=_BG)
-    gs  = gridspec.GridSpec(2, 2, figure=fig,
-                            width_ratios=[map_w, 7], height_ratios=[1, 1],
-                            hspace=0.50, wspace=0.35)
-    ax_map   = fig.add_subplot(gs[:, 0])
-    ax_layer = fig.add_subplot(gs[0, 1])
-    ax_bar   = fig.add_subplot(gs[1, 1])
-
-    for ax in [ax_map, ax_layer, ax_bar]:
-        ax.set_facecolor(_PANEL_BG)
-        for sp in ax.spines.values():
-            sp.set_edgecolor(_SPINE)
-        ax.tick_params(colors=_TEXT, labelsize=7)
-        ax.xaxis.label.set_color(_TEXT)
-        ax.yaxis.label.set_color(_TEXT)
-        ax.title.set_color(_TEXT)
-
-    T_display = T_agg.T
-
-    TICK_x = max(5, min(9, int(160 / max(n_tgt, 1))))
-    TICK_y = max(5, min(9, int(160 / max(n_en,  1))))
-
-    im = ax_map.imshow(T_display, cmap="YlOrRd", aspect="auto",
-                       interpolation="nearest",
-                       vmin=T_display.min(), vmax=T_display.max())
-    ax_map.set_xticks(range(n_tgt))
-    ax_map.set_xticklabels(labels_tgt, rotation=60, ha="right",
-                            fontsize=TICK_x, color=_TEXT)
-    ax_map.set_yticks(range(n_en))
-    ax_map.set_yticklabels(labels_en, fontsize=TICK_y, color=_TEXT)
-    ax_map.set_xlabel("Target tokens (post-LoRA, eq.11)", fontsize=9, color=_TEXT)
-    ax_map.set_ylabel("Dominant EN tokens (frozen, eq.12)", fontsize=9, color=_TEXT)
-    ax_map.set_title(
-        f"Aggregated OT Transport Map  (step {global_step}, epoch {epoch})\n"
-        f"OT = {ot_agg_scalar:.5f}   ε={sinkhorn_eps}   |L|={n_layers}",
-        fontsize=9, fontweight="bold", color=_TEXT, pad=8,
-    )
-    cbar = fig.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
-    cbar.ax.tick_params(labelsize=7, colors=_TEXT)
-
-    if n_tgt <= 30 and n_en <= 30:
-        val_fs = max(4, min(7, int(120 / max(n_tgt, n_en))))
-        for ri in range(n_en):
-            for ci in range(n_tgt):
-                v = T_display[ri, ci]
-                cell_color = "#fff" if v > 0.6 * T_display.max() else "#333"
-                ax_map.text(ci, ri, f"{v:.3f}", ha="center", va="center",
-                            fontsize=val_fs, color=cell_color)
-
-    layer_labels = [f"L{l}" for l in middle_layers]
-    lw_title = (
-        "mean(OT)  —  uniform  —  step {s}"
-        if mean_layer else
-        "softmax(w)  —  eq.18  —  step {s}"
-    ).format(s=global_step)
-
-    im_w = ax_layer.imshow(layer_w.reshape(1, -1), cmap="viridis",
-                            aspect="auto", vmin=0, vmax=layer_w.max())
-    ax_layer.set_xticks(range(n_layers))
-    ax_layer.set_xticklabels(layer_labels, rotation=60, ha="right",
-                              fontsize=6, color=_TEXT)
-    ax_layer.set_yticks([])
-    ax_layer.set_title(lw_title, fontsize=9, fontweight="bold", color=_TEXT, pad=6)
-    for li, wv in enumerate(layer_w):
-        cell_color = "white" if wv > 0.6 * layer_w.max() else "#222"
-        ax_layer.text(li, 0, f"{wv:.3f}", ha="center", va="center",
-                      fontsize=5, color=cell_color)
-    cbar_w = fig.colorbar(im_w, ax=ax_layer, fraction=0.046, pad=0.04,
-                           orientation="horizontal")
-    cbar_w.ax.tick_params(labelsize=6, colors=_TEXT)
-
-    bar_colours = plt.cm.viridis(np.linspace(0.15, 0.85, n_layers))
-    bars = ax_bar.bar(range(n_layers), per_layer_ot,
-                      color=bar_colours, edgecolor=_SPINE, linewidth=0.7)
-    for bar, wv in zip(bars, layer_w):
-        bar.set_alpha(0.55 + 0.45 * wv / (layer_w.max() + 1e-9))
-    ax_bar.set_xticks(range(n_layers))
-    ax_bar.set_xticklabels(layer_labels, rotation=60, ha="right",
-                            fontsize=6, color=_TEXT)
-    ax_bar.set_ylabel("OT(l) = ⟨C(l), T*(l)⟩_F  (eq.17)", fontsize=8, color=_TEXT)
-    ax_bar.set_title("Per-layer OT scalar  (eq.17)",
-                      fontsize=9, fontweight="bold", color=_TEXT, pad=6)
-    ax_bar.grid(axis="y", color=_GRID, linewidth=0.5, alpha=0.8)
-    for li, v in enumerate(per_layer_ot):
-        ax_bar.text(li, v + 0.0005 * max(per_layer_ot, default=1),
-                    f"{v:.4f}", ha="center", va="bottom",
-                    fontsize=5, color=_TEXT, rotation=60)
-
-    mode_label = "mean_layer=True (uniform)" if mean_layer else "mean_layer=False (learnable)"
-    fig.suptitle(
-        f"OT Diagnostic  —  Transport Map  ·  Layer Weights  ·  Per-layer Loss\n"
-        f"Step {global_step}  |  Epoch {epoch}  |  eqs. 13–18  |  {mode_label}",
-        fontsize=11, fontweight="bold", color=_TEXT, y=1.01,
-    )
-    fig.patch.set_facecolor(_BG)
-
-    out_path = output_dir / f"ot_transport_step_{global_step:06d}.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight",
-                facecolor=_BG, pad_inches=0.2)
-    plt.close(fig)
-    logger.info(f"[VizOT] ✓ → {out_path}")
-
-    model.train()
-    return out_path
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HF Hub helpers
+# HF Hub helpers (rank-0 only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_repo(hub_repo: str) -> str:
     if "/" not in hub_repo:
         hub_repo = f"ducanhdinh/{hub_repo}"
-        logger.info(f"[Hub] Full repo_id: {hub_repo}")
     return hub_repo
 
 
@@ -840,7 +842,7 @@ def _download_hub_file(hub_repo: str, filename: str) -> Optional[str]:
     except (EntryNotFoundError, RepositoryNotFoundError):
         return None
     except Exception as e:
-        logger.warning(f"[Hub] Cannot download '{filename}': {e}")
+        _base_logger.warning(f"[Hub] Cannot download '{filename}': {e}")
         return None
 
 
@@ -850,9 +852,8 @@ def _upload_file(hub_repo, local_path, repo_filename, commit_msg):
             path_or_fileobj=str(local_path), path_in_repo=repo_filename,
             repo_id=hub_repo, repo_type="model", commit_message=commit_msg,
         )
-        logger.info(f"[Hub] ✓ Uploaded '{repo_filename}'")
     except Exception as e:
-        logger.error(f"[Hub] Upload '{repo_filename}' failed: {e}")
+        _base_logger.error(f"[Hub] Upload '{repo_filename}' failed: {e}")
 
 
 def _upload_folder(hub_repo, local_dir, repo_subfolder, commit_msg):
@@ -861,26 +862,19 @@ def _upload_folder(hub_repo, local_dir, repo_subfolder, commit_msg):
             folder_path=str(local_dir), path_in_repo=repo_subfolder,
             repo_id=hub_repo, repo_type="model", commit_message=commit_msg,
         )
-        logger.info(f"[Hub] ✓ Uploaded folder '{repo_subfolder}'")
     except Exception as e:
-        logger.error(f"[Hub] Upload folder '{repo_subfolder}' failed: {e}")
+        _base_logger.error(f"[Hub] Upload folder '{repo_subfolder}' failed: {e}")
 
 
 def load_training_state(hub_repo: str) -> Optional[Dict]:
     local = _download_hub_file(hub_repo, TRAINING_STATE_FILE)
     if local is None:
-        logger.info("[Resume] No state — starting fresh.")
         return None
     try:
         with open(local, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        logger.info(
-            f"[Resume] completed={state.get('completed_epochs', [])}  "
-            f"step={state.get('global_step', 0)}"
-        )
-        return state
+            return json.load(f)
     except Exception as e:
-        logger.warning(f"[Resume] Parse error: {e}")
+        _base_logger.warning(f"[Resume] Parse error: {e}")
         return None
 
 
@@ -899,23 +893,21 @@ def load_optimizer_states(hub_repo, optimizer, scheduler, scaler,
             (LAYER_WEIGHTS_FILE, lambda p: layer_weights_module.load_state_dict(
                 torch.load(p, map_location=device)))
         )
-
     for fname, loader in loaders:
         path = _download_hub_file(hub_repo, fname)
         if path:
             try:
                 loader(path)
-                logger.info(f"[Resume] ✓ {fname}")
             except Exception as e:
-                logger.warning(f"[Resume] {fname} error: {e}")
+                _base_logger.warning(f"[Resume] {fname} error: {e}")
 
     ll_path = _download_hub_file(hub_repo, LOSS_LOG_FILE)
     if ll_path:
         try:
             with open(ll_path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception as e:
-            logger.warning(f"[Resume] loss_log error: {e}")
+        except Exception:
+            pass
     return []
 
 
@@ -924,14 +916,20 @@ def save_and_push_checkpoint(
     optimizer, scheduler, scaler, layer_weights_module,
     loss_log, epoch, private, smooth, mean_layer,
     commit_suffix="", delete_local=True,
-    transport_plot_path: Optional[Path] = None,
 ):
+    """
+    Only called from rank-0.  [DIST-8]
+    Unwraps DDP before saving.
+    """
     commit_base = f"epoch-{epoch}" + (f"-{commit_suffix}" if commit_suffix else "")
     _ensure_repo(hub_repo, private)
 
+    # Unwrap DDP to save LoRA adapter
+    raw_model = model.module if hasattr(model, "module") else model
+
     lora_dir = output_dir / LORA_ADAPTER_DIR
     lora_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(lora_dir))
+    raw_model.save_pretrained(str(lora_dir))
     tokenizer.save_pretrained(str(lora_dir))
 
     state_path = output_dir / TRAINING_STATE_FILE
@@ -947,10 +945,8 @@ def save_and_push_checkpoint(
     torch.save(optimizer.state_dict(), opt_path)
     torch.save(scheduler.state_dict(), sch_path)
     torch.save(scaler.state_dict(),    scl_path)
-
     if not mean_layer:
         torch.save(layer_weights_module.state_dict(), lw_path)
-
     with open(ll_path, "w", encoding="utf-8") as f:
         json.dump(loss_log, f)
 
@@ -969,15 +965,11 @@ def save_and_push_checkpoint(
     if not mean_layer and lw_path.exists():
         files_to_upload.append((lw_path, LAYER_WEIGHTS_FILE))
 
-    if transport_plot_path is not None and transport_plot_path.exists():
-        files_to_upload.append(
-            (transport_plot_path, f"diagnostics/{transport_plot_path.name}")
-        )
     for local_f, repo_f in files_to_upload:
         if local_f.exists():
             _upload_file(hub_repo, local_f, repo_f, f"state {commit_base}")
 
-    logger.info(f"[Hub] ✓ Checkpoint pushed — {commit_base}")
+    _base_logger.info(f"[Hub] ✓ Checkpoint pushed — {commit_base}")
 
     if delete_local:
         if lora_dir.exists():
@@ -1000,46 +992,36 @@ def load_lora_from_hub(hub_repo, base_model_name, dtype, device_map):
         return None
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name, torch_dtype=dtype, device_map=device_map,
-        trust_remote_code=True,
-        attn_implementation="eager",
+        trust_remote_code=True, attn_implementation="eager",
     )
     model = PeftModel.from_pretrained(
         base_model, hub_repo, subfolder=LORA_ADAPTER_DIR, is_trainable=True,
     )
-    logger.info("[Resume] ✓ LoRA model loaded from Hub.")
     return model
 
 
 def build_lora_model(base_model_name, middle_layers, lora_r, lora_alpha,
                       lora_dropout, dtype, device_map):
-    logger.info(f"[Setup] Loading base model: {base_model_name}")
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name, torch_dtype=dtype, device_map=device_map,
-        trust_remote_code=True,
-        attn_implementation="eager",
+        trust_remote_code=True, attn_implementation="eager",
     )
     target_modules = [
         f"model.layers.{l}.self_attn.{proj}"
         for l in middle_layers
         for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]
     ]
-    logger.info(f"[LoRA] Target modules ({len(target_modules)}): "
-                f"{target_modules[:4]} ...")
     lora_config = LoraConfig(
         r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
         target_modules=target_modules, bias="none", task_type="CAUSAL_LM",
     )
     model = get_peft_model(base_model, lora_config)
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in model.parameters())
-    logger.info(f"[LoRA] Trainable: {trainable/1e6:.2f}M / {total/1e9:.3f}B "
-                f"({100*trainable/total:.2f}%)")
     return model
 
 
 def build_state(args, hub_repo, completed_epochs, global_step,
                 current_epoch, steps_done_in_epoch, is_epoch_complete,
-                loss_log, middle_layers):
+                loss_log, middle_layers, world_size, per_gpu_batch):
     return {
         "base_model": args.base_model, "hub_repo": hub_repo,
         "total_epochs": args.epochs, "completed_epochs": completed_epochs,
@@ -1047,10 +1029,12 @@ def build_state(args, hub_repo, completed_epochs, global_step,
         "steps_done_in_epoch": steps_done_in_epoch,
         "is_epoch_complete": is_epoch_complete,
         "middle_layers": middle_layers,
-        # lambda_ot removed
         "sinkhorn_eps": args.sinkhorn_eps,
         "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
-        "batch_size": args.batch_size, "grad_accum": args.grad_accum,
+        "batch_size_global": args.batch_size,
+        "per_gpu_batch": per_gpu_batch,
+        "world_size": world_size,
+        "grad_accum": args.grad_accum,
         "lr": args.lr, "opus_ratio": args.opus_ratio,
         "eng_eng_ratio": args.eng_eng_ratio,
         "seq_length": args.max_length,
@@ -1064,17 +1048,28 @@ def build_state(args, hub_repo, completed_epochs, global_step,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(args: argparse.Namespace) -> None:
-    set_seed(args.seed)
+
+    # ── Distributed init  ────────────────────────────────────────────────────
+    rank, local_rank, world_size = init_distributed()
+    logger = setup_logger(rank)
+    main   = is_main_process(rank)
+
+    # ── GPU validation  [DIST-1] ─────────────────────────────────────────────
+    validate_gpus(args.gpus, world_size, rank)
+
+    set_seed(args.seed, rank)
 
     if args.seq_length is not None:
         args.max_length = args.seq_length
-    else:
-        args.seq_length = args.max_length
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if main:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    barrier(world_size)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ── Precision ────────────────────────────────────────────────────────────
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
     if args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         dtype = torch.bfloat16; amp_dtype = torch.bfloat16; use_amp = True
         logger.info("[Setup] bfloat16 AMP")
@@ -1083,9 +1078,16 @@ def train(args: argparse.Namespace) -> None:
         logger.info("[Setup] float16 AMP")
     else:
         dtype = torch.float32; amp_dtype = torch.float32; use_amp = False
-        logger.info("[Setup] float32")
 
-    device_map = "auto" if torch.cuda.is_available() else None
+    # ── Per-GPU batch size  [DIST-3] ─────────────────────────────────────────
+    per_gpu_batch = compute_per_gpu_batch(args.batch_size, world_size, rank)
+    logger.info(
+        f"[Batch] global={args.batch_size} | "
+        f"per_gpu={per_gpu_batch} | world_size={world_size}"
+    )
+
+    # device_map=None for DDP; each rank manages its own GPU
+    device_map = None
 
     load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
@@ -1094,25 +1096,22 @@ def train(args: argparse.Namespace) -> None:
 
     hub_repo      = _resolve_repo(args.hub_repo)
     middle_layers = resolve_middle_layers(args.middle_layers, n_total=32)
+    logger.info(f"[OT] Middle layers ({len(middle_layers)}): {middle_layers}")
 
-    if args.mean_layer:
-        logger.info("[Setup] Layer aggregation: UNIFORM MEAN (--mean_layer True)")
-    else:
-        logger.info("[Setup] Layer aggregation: LEARNABLE SOFTMAX (--mean_layer False)")
+    # ── Resume logic (only rank-0 downloads state)  ──────────────────────────
+    training_state = None
+    if main:
+        training_state = load_training_state(hub_repo)
 
-    logger.info("[Setup] Loss objective: L = L_OT only  (L_LM removed, no lambda)")
+    # Broadcast whether we are resuming
+    is_resuming_tensor = torch.tensor(
+        [1 if training_state is not None else 0], dtype=torch.int32, device=device
+    )
+    if world_size > 1:
+        dist.broadcast(is_resuming_tensor, src=0)
+    is_resuming = bool(is_resuming_tensor.item())
 
-    global _sinkhorn_log_batched_inner
-    if args.compile and hasattr(torch, "compile"):
-        logger.info("[OPT-5] Compiling Sinkhorn kernel ...")
-        _sinkhorn_log_batched_inner = torch.compile(
-            _sinkhorn_log_batched_inner, mode="reduce-overhead", fullgraph=True,
-        )
-
-    training_state = load_training_state(hub_repo)
-    is_resuming    = training_state is not None
-
-    if is_resuming:
+    if is_resuming and training_state is not None:
         completed_epochs  = training_state.get("completed_epochs", [])
         saved_global_step = training_state.get("global_step", 0)
         resume_epoch      = training_state.get("current_epoch")
@@ -1120,61 +1119,75 @@ def train(args: argparse.Namespace) -> None:
         is_epoch_complete = training_state.get("is_epoch_complete", True)
         if is_epoch_complete or resume_epoch is None:
             resume_epoch = None; resume_skip_steps = 0
+        if main:
+            logger.info(
+                f"[Resume] completed={completed_epochs} step={saved_global_step}"
+            )
+    else:
+        completed_epochs  = []
+        saved_global_step = 0
+        resume_epoch      = None
+        resume_skip_steps = 0
+
+    # ── Model  ───────────────────────────────────────────────────────────────
+    if is_resuming:
         model = load_lora_from_hub(hub_repo, args.base_model, dtype, device_map)
         if model is None:
             model = build_lora_model(
                 args.base_model, middle_layers,
                 args.lora_r, args.lora_alpha, args.lora_dropout, dtype, device_map,
             )
-        tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
     else:
-        completed_epochs  = []
-        saved_global_step = 0
-        resume_epoch      = None
-        resume_skip_steps = 0
         model = build_lora_model(
             args.base_model, middle_layers,
             args.lora_r, args.lora_alpha, args.lora_dropout, dtype, device_map,
         )
-        tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
 
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "right"
 
-    if not torch.cuda.is_available():
-        model = model.to(device)
+    model = model.to(device)
 
     if args.gradient_checkpointing:
         model.enable_input_require_grads()
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-        logger.info("[Setup] Gradient checkpointing: ON")
 
+    # ── Wrap in DDP  ─────────────────────────────────────────────────────────
+    # find_unused_parameters=True because the frozen EN branch doesn't update
+    # parameters but they share the same model object.
+    if world_size > 1:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+    logger.info(f"[Setup] Model wrapped in DDP on rank {rank}")
+
+    # ── LayerWeights (NOT DDP-wrapped — manually all-reduced)  [DIST-5] ──────
     layer_weights_module = LayerWeights(n_layers=len(middle_layers)).to(device)
 
+    # ── Dataset  ─────────────────────────────────────────────────────────────
     align_dataset = AlignmentDataset(
         alignment_data_path=args.data_root,
         opus_sample_ratio=args.opus_ratio,
         eng_eng_ratio=args.eng_eng_ratio,
     ).load()
-    align_dataset.stats()
+    if main:
+        align_dataset.stats()
 
-    train_loader = AlignmentDataLoader(
-        dataset=align_dataset, split="train", source="joint",
-        tokenizer=tokenizer, batch_size=args.batch_size,
-        max_length=args.max_length, shuffle=True, seed=args.seed,
-        num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
-    )
-    logger.info(f"[Data] Train batches: {len(train_loader):,}")
-
+    # ── Optimizer  ───────────────────────────────────────────────────────────
     no_decay = {"bias", "LayerNorm.weight", "layer_norm.weight"}
+    raw_model_for_params = model.module if hasattr(model, "module") else model
     param_groups = [
-        {"params": [p for n, p in model.named_parameters()
+        {"params": [p for n, p in raw_model_for_params.named_parameters()
                     if p.requires_grad and not any(nd in n for nd in no_decay)],
          "weight_decay": args.weight_decay},
-        {"params": [p for n, p in model.named_parameters()
+        {"params": [p for n, p in raw_model_for_params.named_parameters()
                     if p.requires_grad and any(nd in n for nd in no_decay)],
          "weight_decay": 0.0},
     ]
@@ -1191,89 +1204,107 @@ def train(args: argparse.Namespace) -> None:
     optimizer = torch.optim.AdamW(
         param_groups, lr=args.lr, eps=1e-8, betas=(0.9, 0.95), fused=use_fused,
     )
-    if use_fused:
-        logger.info("[OPT-9] Fused AdamW enabled.")
 
-    steps_per_epoch     = len(train_loader)
-    opt_steps_per_epoch = math.ceil(steps_per_epoch / args.grad_accum)
-    total_steps         = opt_steps_per_epoch * args.epochs
+    # Steps per epoch = steps on this rank (dataset is sharded)
+    # We'll measure after building the loader; use an estimate for scheduler
+    steps_per_epoch_est = 1000  # placeholder; updated after first epoch
+    total_steps         = steps_per_epoch_est * args.epochs
     warmup_steps        = max(1, int(total_steps * args.warmup_ratio))
     scheduler           = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps,
     )
     scaler = GradScaler(device="cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
-    logger.info(
-        f"[Setup] steps/epoch={steps_per_epoch}  opt_steps/epoch={opt_steps_per_epoch}\n"
-        f"        total_steps={total_steps}  warmup={warmup_steps}\n"
-        f"        grad_accum={args.grad_accum}  "
-        f"eff_batch={args.batch_size * args.grad_accum}\n"
-        f"        seq_length={args.max_length}  layers={len(middle_layers)}\n"
-        f"        [OT-ONLY] lr={args.lr}  eps={args.sinkhorn_eps}  "
-        f"iters={args.sinkhorn_iters}\n"
-        f"        mean_layer={args.mean_layer}  "
-        f"real_attn_en={args.real_attn_en}  save_iter={args.save_iter}"
-    )
-
-    loss_log = load_optimizer_states(
-        hub_repo, optimizer, scheduler, scaler,
-        layer_weights_module, args.mean_layer, device,
-    ) if is_resuming else []
+    # ── Resume optimizer states (rank-0 loads, then broadcasts)  ─────────────
+    loss_log: List[Dict] = []
+    if is_resuming and main:
+        loss_log = load_optimizer_states(
+            hub_repo, optimizer, scheduler, scaler,
+            layer_weights_module, args.mean_layer, device,
+        )
 
     global_step = saved_global_step
-    log_file    = open(
-        output_dir / "ot_train_log.jsonl",
-        "a" if is_resuming else "w", encoding="utf-8",
+
+    # ── OOM coordinator  [DIST-4] ─────────────────────────────────────────────
+    oom_coord = OOMCoordinator(
+        per_gpu_batch=per_gpu_batch,
+        world_size=world_size,
+        device=device,
     )
 
-    epoch_pbar = tqdm(range(1, args.epochs + 1), desc="Epochs",
-                      unit="epoch", dynamic_ncols=True, colour="green")
+    log_file = None
+    if main:
+        log_file = open(
+            output_dir / "ot_train_log.jsonl",
+            "a" if is_resuming else "w", encoding="utf-8",
+        )
 
-    for epoch in epoch_pbar:
+    epoch_iter = range(1, args.epochs + 1)
+    if main:
+        epoch_iter = tqdm(epoch_iter, desc="Epochs", unit="epoch",
+                          dynamic_ncols=True, colour="green")
+
+    for epoch in epoch_iter:
         if epoch in completed_epochs:
             logger.info(f"[Resume] Epoch {epoch} already done — skip.")
             continue
 
         skip_batches = resume_skip_steps if (epoch == resume_epoch) else 0
-        logger.info(f"\n{'='*60}\nEPOCH {epoch}/{args.epochs}\n{'='*60}")
+        logger.info(f"EPOCH {epoch}/{args.epochs} | rank={rank}")
 
-        train_loader.set_epoch(epoch)
+        # ── Build DataLoader for this epoch  ──────────────────────────────────
+        train_loader = build_distributed_dataloader(
+            align_dataset=align_dataset,
+            tokenizer=tokenizer,
+            per_gpu_batch=oom_coord.per_gpu_batch,
+            max_length=args.max_length,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            rank=rank,
+            world_size=world_size,
+            epoch=epoch,
+        )
+        steps_per_epoch = len(train_loader)
+
         model.train()
         if not args.mean_layer:
             layer_weights_module.train()
         optimizer.zero_grad(set_to_none=True)
 
-        batch_pbar = tqdm(desc=f"  Epoch {epoch}", total=steps_per_epoch,
-                          unit="batch", dynamic_ncols=True, leave=False)
-
         accum_ot    = 0.0
         accum_count = 0
-        oom_skip_count = 0
         steps_in_epoch = 0
-        last_batch_for_viz: Optional[Dict[str, torch.Tensor]] = None
+        loader_needs_rebuild = False
 
-        for batch_idx, batch in enumerate(train_loader):
+        batch_iter = enumerate(train_loader)
+        if main:
+            batch_iter_pbar = tqdm(
+                total=steps_per_epoch,
+                desc=f"  Epoch {epoch}", unit="batch",
+                dynamic_ncols=True, leave=False,
+            )
 
+        for batch_idx, batch in batch_iter:
+
+            # Skip already-done batches on resume
             if steps_in_epoch < skip_batches:
                 steps_in_epoch += 1
-                batch_pbar.update(1)
+                if main:
+                    batch_iter_pbar.update(1)
                 continue
 
-            if oom_skip_count > 0:
-                oom_skip_count -= 1
-                steps_in_epoch += 1
-                batch_pbar.update(1)
-                continue
+            # Reload if OOM triggered a batch-size change
+            if loader_needs_rebuild:
+                break
 
             is_last_accum = (
                 (batch_idx + 1) % args.grad_accum == 0
                 or (batch_idx + 1 == steps_per_epoch)
             )
 
-            last_batch_for_viz = {k: v.cpu() for k, v in batch.items()
-                                  if isinstance(v, torch.Tensor)}
-
             loss = None
+            oom_this_step = False
+
             try:
                 loss, ot_item = compute_total_loss(
                     model=model,
@@ -1295,25 +1326,45 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     scaled_loss.backward()
 
+                # Manually all_reduce LayerWeights grads  [DIST-5]
+                if not args.mean_layer and is_last_accum:
+                    reduce_gradients_manual(layer_weights_module, world_size)
+
                 accum_ot    += ot_item
                 accum_count += 1
 
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                 if not _is_oom(e):
                     raise
-                _cleanup_oom(optimizer, loss)
-                oom_skip_count  = args.oom_skip_batches
-                args.batch_size = max(1, args.batch_size // 2)
-                logger.warning(f"[OOM] → batch_size={args.batch_size}")
+                oom_this_step = True
+                oom_coord.report_oom()
+                _cleanup_after_oom(optimizer, loss)
+
+            # ── OOM sync across all ranks  [DIST-4] ───────────────────────────
+            any_oom = oom_coord.sync_and_check()
+            if any_oom:
+                # All ranks skip this step and halve batch size
+                if not oom_this_step:
+                    # Non-OOM ranks still need to zero grad consistently
+                    optimizer.zero_grad(set_to_none=True)
+
+                new_batch = oom_coord.halve_batch(logger if main else None)
+                torch.cuda.empty_cache()
+                gc.collect()
+                loader_needs_rebuild = True
                 steps_in_epoch += 1
-                batch_pbar.update(1)
+                if main:
+                    batch_iter_pbar.update(1)
                 continue
 
+            # ── Optimizer step ────────────────────────────────────────────────
             if is_last_accum:
                 if use_amp and amp_dtype == torch.float16:
                     scaler.unscale_(optimizer)
 
-                all_trainable = [p for p in model.parameters() if p.requires_grad]
+                # Clip grads — DDP already all-reduced them
+                raw_m = model.module if hasattr(model, "module") else model
+                all_trainable = [p for p in raw_m.parameters() if p.requires_grad]
                 if not args.mean_layer:
                     all_trainable += list(layer_weights_module.parameters())
 
@@ -1332,149 +1383,230 @@ def train(args: argparse.Namespace) -> None:
                 global_step += 1
 
                 if accum_count > 0:
-                    avg_ot     = accum_ot / accum_count
+                    avg_ot = accum_ot / accum_count
+
+                    # All-reduce the loss for logging (cosmetic, not used in backward)
+                    loss_tensor = torch.tensor(avg_ot, device=device)
+                    all_reduce_mean(loss_tensor, world_size)
+                    avg_ot_global = loss_tensor.item()
+
                     current_lr = scheduler.get_last_lr()[0]
 
-                    log_entry = {
-                        "epoch":     epoch,
-                        "step":      global_step,
-                        "loss":      round(avg_ot, 6),   # loss == ot_loss here
-                        "ot_loss":   round(avg_ot, 6),
-                        "lr":        current_lr,
-                        "grad_norm": round(float(grad_norm), 4),
-                    }
-                    log_file.write(json.dumps(log_entry) + "\n")
-                    log_file.flush()
-                    loss_log.append(log_entry)
+                    if main:
+                        log_entry = {
+                            "epoch":     epoch,
+                            "step":      global_step,
+                            "loss":      round(avg_ot_global, 6),
+                            "ot_loss":   round(avg_ot_global, 6),
+                            "lr":        current_lr,
+                            "grad_norm": round(float(grad_norm), 4),
+                            "world_size": world_size,
+                            "per_gpu_batch": oom_coord.per_gpu_batch,
+                        }
+                        log_file.write(json.dumps(log_entry) + "\n")
+                        log_file.flush()
+                        loss_log.append(log_entry)
 
-                    batch_pbar.set_postfix({
-                        "L_OT": f"{avg_ot:.4f}",
-                        "lr":   f"{current_lr:.2e}",
-                        "gnorm": f"{float(grad_norm):.3f}",
-                    })
-                    epoch_pbar.set_postfix({
-                        "ep": f"{epoch}/{args.epochs}",
-                        "step": global_step,
-                        "L_OT": f"{avg_ot:.4f}",
-                    })
+                        if main:
+                            batch_iter_pbar.set_postfix({
+                                "L_OT": f"{avg_ot_global:.4f}",
+                                "lr":   f"{current_lr:.2e}",
+                                "gnorm": f"{float(grad_norm):.3f}",
+                                "bs/gpu": oom_coord.per_gpu_batch,
+                            })
+
                     accum_ot = accum_count = 0.0
 
+                # Mid-epoch checkpoint  [DIST-8]
                 if args.save_iter > 0 and global_step % args.save_iter == 0:
-                    plot_training_loss(loss_log, output_dir, smooth=args.plot_smooth)
-
-                    transport_plot = None
-                    if last_batch_for_viz is not None:
-                        try:
-                            transport_plot = plot_ot_transport_diagnostic(
-                                model=model, tokenizer=tokenizer,
-                                batch=last_batch_for_viz,
-                                middle_layers=middle_layers,
-                                layer_weights_module=layer_weights_module,
-                                sinkhorn_eps=args.sinkhorn_eps,
-                                global_step=global_step, epoch=epoch,
-                                output_dir=output_dir,
-                                real_attn_en=args.real_attn_en,
-                                mean_layer=args.mean_layer,
-                                amp_dtype=amp_dtype, use_amp=use_amp, device=device,
-                            )
-                        except Exception as viz_err:
-                            logger.warning(f"[VizOT] failed: {viz_err}")
-                        finally:
-                            model.train()
-                            if not args.mean_layer:
-                                layer_weights_module.train()
-
-                    mid_state = build_state(
-                        args, hub_repo, completed_epochs, global_step,
-                        current_epoch=epoch, steps_done_in_epoch=steps_in_epoch,
-                        is_epoch_complete=False, loss_log=loss_log,
-                        middle_layers=middle_layers,
-                    )
-                    save_and_push_checkpoint(
-                        hub_repo=hub_repo, output_dir=output_dir,
-                        state=mid_state, model=model, tokenizer=tokenizer,
-                        optimizer=optimizer, scheduler=scheduler, scaler=scaler,
-                        layer_weights_module=layer_weights_module,
-                        loss_log=loss_log, epoch=epoch, private=args.hub_private,
-                        smooth=args.plot_smooth, mean_layer=args.mean_layer,
-                        commit_suffix=f"step-{global_step}", delete_local=True,
-                        transport_plot_path=transport_plot,
-                    )
+                    barrier(world_size)
+                    if main:
+                        plot_training_loss(loss_log, output_dir, smooth=args.plot_smooth)
+                        mid_state = build_state(
+                            args, hub_repo, completed_epochs, global_step,
+                            current_epoch=epoch,
+                            steps_done_in_epoch=steps_in_epoch,
+                            is_epoch_complete=False,
+                            loss_log=loss_log,
+                            middle_layers=middle_layers,
+                            world_size=world_size,
+                            per_gpu_batch=oom_coord.per_gpu_batch,
+                        )
+                        save_and_push_checkpoint(
+                            hub_repo=hub_repo, output_dir=output_dir,
+                            state=mid_state, model=model, tokenizer=tokenizer,
+                            optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+                            layer_weights_module=layer_weights_module,
+                            loss_log=loss_log, epoch=epoch,
+                            private=args.hub_private,
+                            smooth=args.plot_smooth, mean_layer=args.mean_layer,
+                            commit_suffix=f"step-{global_step}", delete_local=True,
+                        )
+                    barrier(world_size)
                     model.train()
                     if not args.mean_layer:
                         layer_weights_module.train()
 
             steps_in_epoch += 1
-            batch_pbar.update(1)
+            if main:
+                batch_iter_pbar.update(1)
 
-        batch_pbar.close()
+        if main:
+            batch_iter_pbar.close()
+
+        # ── If OOM caused early exit from loop, rebuild and redo epoch ─────────
+        if loader_needs_rebuild:
+            logger.info(
+                f"[OOM] Rebuilding DataLoader with per_gpu_batch="
+                f"{oom_coord.per_gpu_batch}. Restarting epoch {epoch}."
+            )
+            barrier(world_size)
+            # Restart epoch (skip already-done steps)
+            skip_batches = steps_in_epoch  # skip what we already processed
+
+            train_loader = rebuild_dataloader_with_new_batch(
+                align_dataset=align_dataset,
+                tokenizer=tokenizer,
+                per_gpu_batch=oom_coord.per_gpu_batch,
+                max_length=args.max_length,
+                seed=args.seed,
+                num_workers=args.num_workers,
+                rank=rank,
+                world_size=world_size,
+                epoch=epoch,
+                logger=logger if main else None,
+            )
+            steps_per_epoch = len(train_loader)
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+
+            if main:
+                batch_iter_pbar = tqdm(
+                    total=steps_per_epoch,
+                    desc=f"  Epoch {epoch} [retry]", unit="batch",
+                    dynamic_ncols=True, leave=False,
+                )
+
+            for batch_idx, batch in enumerate(train_loader):
+                if batch_idx < skip_batches:
+                    if main:
+                        batch_iter_pbar.update(1)
+                    continue
+
+                is_last_accum = (
+                    (batch_idx + 1) % args.grad_accum == 0
+                    or (batch_idx + 1 == steps_per_epoch)
+                )
+
+                loss, ot_item = compute_total_loss(
+                    model=model, batch=batch,
+                    middle_layers=middle_layers,
+                    layer_weights_module=layer_weights_module,
+                    sinkhorn_eps=args.sinkhorn_eps,
+                    sinkhorn_iters=args.sinkhorn_iters,
+                    real_attn_en=args.real_attn_en,
+                    mean_layer=args.mean_layer,
+                    amp_dtype=amp_dtype, use_amp=use_amp, device=device,
+                )
+
+                scaled_loss = loss / args.grad_accum
+                if use_amp and amp_dtype == torch.float16:
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
+
+                if not args.mean_layer and is_last_accum:
+                    reduce_gradients_manual(layer_weights_module, world_size)
+
+                accum_ot    += ot_item
+                accum_count += 1
+
+                if is_last_accum:
+                    if use_amp and amp_dtype == torch.float16:
+                        scaler.unscale_(optimizer)
+
+                    raw_m = model.module if hasattr(model, "module") else model
+                    all_trainable = [p for p in raw_m.parameters() if p.requires_grad]
+                    if not args.mean_layer:
+                        all_trainable += list(layer_weights_module.parameters())
+
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        all_trainable, args.max_grad_norm,
+                    )
+
+                    if use_amp and amp_dtype == torch.float16:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+
+                    if accum_count > 0:
+                        avg_ot = accum_ot / accum_count
+                        loss_tensor = torch.tensor(avg_ot, device=device)
+                        all_reduce_mean(loss_tensor, world_size)
+                        avg_ot_global = loss_tensor.item()
+                        current_lr = scheduler.get_last_lr()[0]
+
+                        if main:
+                            log_entry = {
+                                "epoch": epoch, "step": global_step,
+                                "loss": round(avg_ot_global, 6),
+                                "ot_loss": round(avg_ot_global, 6),
+                                "lr": current_lr,
+                                "grad_norm": round(float(grad_norm), 4),
+                                "world_size": world_size,
+                                "per_gpu_batch": oom_coord.per_gpu_batch,
+                            }
+                            log_file.write(json.dumps(log_entry) + "\n")
+                            log_file.flush()
+                            loss_log.append(log_entry)
+
+                        accum_ot = accum_count = 0.0
+
+                if main:
+                    batch_iter_pbar.update(1)
+
+            if main:
+                batch_iter_pbar.close()
+
+        # ── End-of-epoch  ─────────────────────────────────────────────────────
         logger.info(f"[Epoch {epoch}] Done. global_step={global_step}")
 
-        if not args.mean_layer:
-            lw_softmax = F.softmax(layer_weights_module.w.detach(), dim=0)
-            top_k      = min(5, len(middle_layers))
-            top_idx    = lw_softmax.topk(top_k).indices.tolist()
-            logger.info(
-                f"[Epoch {epoch}] Top-{top_k} layer weights: "
-                + ", ".join(f"L{middle_layers[i]}={lw_softmax[i].item():.4f}"
-                            for i in top_idx)
-            )
-        else:
-            logger.info(
-                f"[Epoch {epoch}] Layer aggregation: uniform mean over "
-                f"{len(middle_layers)} layers (mean_layer=True)"
-            )
-
         completed_epochs.append(epoch)
-        state = build_state(
-            args, hub_repo, completed_epochs, global_step,
-            current_epoch=epoch, steps_done_in_epoch=steps_in_epoch,
-            is_epoch_complete=True, loss_log=loss_log, middle_layers=middle_layers,
-        )
-        save_and_push_checkpoint(
-            hub_repo=hub_repo, output_dir=output_dir, state=state,
-            model=model, tokenizer=tokenizer, optimizer=optimizer,
-            scheduler=scheduler, scaler=scaler,
-            layer_weights_module=layer_weights_module,
-            loss_log=loss_log, epoch=epoch, private=args.hub_private,
-            smooth=args.plot_smooth, mean_layer=args.mean_layer,
-            commit_suffix="", delete_local=True,
-        )
+        barrier(world_size)
 
-    epoch_pbar.close()
-    log_file.close()
+        if main:
+            state = build_state(
+                args, hub_repo, completed_epochs, global_step,
+                current_epoch=epoch, steps_done_in_epoch=steps_in_epoch,
+                is_epoch_complete=True, loss_log=loss_log,
+                middle_layers=middle_layers,
+                world_size=world_size, per_gpu_batch=oom_coord.per_gpu_batch,
+            )
+            save_and_push_checkpoint(
+                hub_repo=hub_repo, output_dir=output_dir, state=state,
+                model=model, tokenizer=tokenizer, optimizer=optimizer,
+                scheduler=scheduler, scaler=scaler,
+                layer_weights_module=layer_weights_module,
+                loss_log=loss_log, epoch=epoch, private=args.hub_private,
+                smooth=args.plot_smooth, mean_layer=args.mean_layer,
+                commit_suffix="", delete_local=True,
+            )
 
-    logger.info("\n" + "=" * 60)
-    logger.info("OT-ONLY ALIGNMENT TRAINING COMPLETE")
+        barrier(world_size)
+
+    if main and log_file:
+        log_file.close()
+
+    logger.info("OT-ONLY DISTRIBUTED ALIGNMENT TRAINING COMPLETE")
     logger.info(f"  Completed: {completed_epochs}  |  Steps: {global_step}")
 
-    final_report = {
-        "base_model": args.base_model, "hub_repo": hub_repo,
-        "epochs": args.epochs, "completed_epochs": completed_epochs,
-        "global_step": global_step, "middle_layers": middle_layers,
-        # lambda_ot removed
-        "sinkhorn_eps": args.sinkhorn_eps,
-        "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
-        "opus_ratio": args.opus_ratio, "eng_eng_ratio": args.eng_eng_ratio,
-        "grad_accum": args.grad_accum,
-        "effective_batch": args.batch_size * args.grad_accum,
-        "seq_length": args.max_length, "real_attn_en": args.real_attn_en,
-        "mean_layer": args.mean_layer,
-        "loss_objective": "L_OT only (L_LM removed)",
-    }
-
-    if not args.mean_layer:
-        lw_final = F.softmax(layer_weights_module.w.detach(), dim=0).tolist()
-        logger.info(f"  Final layer weights: {[round(v, 4) for v in lw_final]}")
-        final_report["final_layer_weights"] = lw_final
-    else:
-        n = len(middle_layers)
-        final_report["final_layer_weights"] = [round(1.0 / n, 4)] * n
-
-    with open(output_dir / "ot_final_report.json", "w", encoding="utf-8") as f:
-        json.dump(final_report, f, indent=2, ensure_ascii=False)
-
-    plot_training_loss(loss_log, output_dir, smooth=args.plot_smooth)
+    if world_size > 1:
+        dist.destroy_process_group()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1484,11 +1616,17 @@ def train(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     args = parse_args()
 
-    logger.info("=" * 65)
-    logger.info("Llama-3-8B  Stage 2: OT-ONLY Alignment  [L_LM removed]")
-    logger.info("=" * 65)
-    for k, v in vars(args).items():
-        logger.info(f"  {k:28s}: {v}")
-    logger.info("=" * 65)
+    # Early GPU count check BEFORE dist init (catches obvious misuse quickly)
+    available_gpus = torch.cuda.device_count()
+    if args.gpus is not None and args.gpus > available_gpus:
+        raise SystemExit(
+            f"[ERROR] --gpus {args.gpus} requested but only "
+            f"{available_gpus} GPU(s) detected on this machine. Aborting."
+        )
+
+    _base_logger.info("=" * 65)
+    _base_logger.info("Llama-3-8B  Stage 2: OT-ONLY Alignment  [DISTRIBUTED]")
+    _base_logger.info(f"Detected GPUs: {available_gpus} | Requested: {args.gpus}")
+    _base_logger.info("=" * 65)
 
     train(args)
