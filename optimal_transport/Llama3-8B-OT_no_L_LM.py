@@ -147,9 +147,12 @@ def is_main_process(rank: int) -> bool:
     return rank == 0
 
 
-def barrier(world_size: int) -> None:
+def barrier(world_size: int, device: torch.device = None) -> None:
     if world_size > 1:
-        dist.barrier()
+        if device is not None:
+            dist.barrier(device_ids=[device.index])
+        else:
+            dist.barrier()
 
 
 def all_reduce_mean(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
@@ -1065,7 +1068,7 @@ def train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     if main:
         output_dir.mkdir(parents=True, exist_ok=True)
-    barrier(world_size)
+    barrier(world_size, device)
 
     # ── Precision ────────────────────────────────────────────────────────────
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
@@ -1419,7 +1422,7 @@ def train(args: argparse.Namespace) -> None:
 
                 # Mid-epoch checkpoint  [DIST-8]
                 if args.save_iter > 0 and global_step % args.save_iter == 0:
-                    barrier(world_size)
+                    barrier(world_size, device)
                     if main:
                         plot_training_loss(loss_log, output_dir, smooth=args.plot_smooth)
                         mid_state = build_state(
@@ -1442,7 +1445,7 @@ def train(args: argparse.Namespace) -> None:
                             smooth=args.plot_smooth, mean_layer=args.mean_layer,
                             commit_suffix=f"step-{global_step}", delete_local=True,
                         )
-                    barrier(world_size)
+                    barrier(world_size, device)
                     model.train()
                     if not args.mean_layer:
                         layer_weights_module.train()
@@ -1460,7 +1463,7 @@ def train(args: argparse.Namespace) -> None:
                 f"[OOM] Rebuilding DataLoader with per_gpu_batch="
                 f"{oom_coord.per_gpu_batch}. Restarting epoch {epoch}."
             )
-            barrier(world_size)
+            barrier(world_size, device)
             # Restart epoch (skip already-done steps)
             skip_batches = steps_in_epoch  # skip what we already processed
 
@@ -1577,7 +1580,7 @@ def train(args: argparse.Namespace) -> None:
         logger.info(f"[Epoch {epoch}] Done. global_step={global_step}")
 
         completed_epochs.append(epoch)
-        barrier(world_size)
+        barrier(world_size, device)
 
         if main:
             state = build_state(
