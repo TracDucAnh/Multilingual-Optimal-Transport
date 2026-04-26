@@ -1068,10 +1068,11 @@ def train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     if main:
         output_dir.mkdir(parents=True, exist_ok=True)
-    barrier(world_size, device)
 
     # ── Precision ────────────────────────────────────────────────────────────
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    
+    barrier(world_size, device)
 
     if args.bf16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         dtype = torch.bfloat16; amp_dtype = torch.bfloat16; use_amp = True
